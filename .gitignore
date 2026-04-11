@@ -1,0 +1,13 @@
+.env
+.credentials
+.client-links
+.state/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+*.pem
+*.key
+/tmp/
+*.txt
