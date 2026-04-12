@@ -1,0 +1,1 @@
+pipeline_state_dir: "{{ playbook_dir }}/../../state"

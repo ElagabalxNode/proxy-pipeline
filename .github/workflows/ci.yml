@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform fmt + validate
+        working-directory: terraform
+        run: |
+          terraform init -input=false
+          terraform fmt -check
+          terraform validate
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install orchestrator + test
+        run: |
+          pip install -e "./orchestrator[dev]"
+          pytest -q orchestrator/tests
+
+      - name: Ruff
+        run: |
+          pip install ruff
+          ruff check orchestrator/src orchestrator/tests
+
+      - name: Ansible syntax
+        run: |
+          pip install ansible
+          printf '%s\n' \
+            '[exit]' \
+            'exit_node ansible_host=127.0.0.1 ansible_connection=local' \
+            '' \
+            '[bridge]' \
+            'bridge_node ansible_host=127.0.0.1 ansible_connection=local' > /tmp/inv.ini
+          ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook --syntax-check -i /tmp/inv.ini ansible/playbooks/exit_only.yml
+          ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook --syntax-check -i /tmp/inv.ini ansible/playbooks/site.yml

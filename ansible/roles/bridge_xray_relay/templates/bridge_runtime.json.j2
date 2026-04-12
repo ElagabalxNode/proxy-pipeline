@@ -1,0 +1,7 @@
+{
+  "bridge_ip": "{{ ansible_host }}",
+  "bridge_ssh_user": "{{ ansible_user | default('ubuntu') }}",
+  "bridge_uuid": "{{ bridge_client_uuid }}",
+  "bridge_public_key": "{{ bridge_public_key }}",
+  "bridge_short_id": "{{ bridge_short_id }}"
+}

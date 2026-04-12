@@ -1,13 +1,89 @@
+# --- Секреты и локальная конфигурация ---
 .env
+.env.*
+!.env.example
 .credentials
+*.pem
+*.key
+id_rsa
+id_ed25519
+id_ecdsa
+*.p12
+*.pfx
+
+# Конфиг пайплайна с секретами (пример остаётся в репозитории)
+config/pipeline.yaml
+config/key.json
+config/key.*.json
+config/secrets.yaml
+config/*.local.yaml
+
+# Артефакты клиентских ссылок и QR (содержат учётные данные)
 .client-links
+.client-links-qr/
+
+# Состояние после configure (runtime, cookies API, временные JSON)
+state/
+
+# Старый путь состояния (если встретится)
 .state/
+
+# --- Terraform ---
 terraform/*.tfstate
-terraform/*.tfstate.backup
+terraform/*.tfstate.*
 terraform/.terraform/
 terraform/.terraform.lock.hcl
 terraform/terraform.tfvars
-*.pem
-*.key
-/tmp/
-*.txt
+terraform/*.auto.tfvars
+terraform/*.auto.tfvars.json
+
+# --- Ansible ---
+ansible/inventory/hosts.ini
+
+# --- Python / pip / оркестратор (editable install, venv, сборки) ---
+.venv/
+venv/
+env/
+ENV/
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+pip-log.txt
+pip-delete-this-directory.txt
+
+build/
+dist/
+wheels/
+share/python-wheels/
+*.manifest
+*.spec
+
+# pytest / coverage / mypy / ruff
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Редакторы и ОС
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Временные каталоги
+tmp/
+temp/
+**/tmp/

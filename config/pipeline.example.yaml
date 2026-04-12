@@ -1,0 +1,47 @@
+# Copy to config/pipeline.yaml and adjust (config/pipeline.yaml is gitignored).
+# Secrets: use environment variables (see docs/PIPELINE.md) or a local secrets file — never commit tokens.
+
+version: 1
+
+paths:
+  terraform_dir: terraform
+  ansible_dir: ansible
+  state_dir: state
+
+providers:
+  cherry:
+    enabled: true
+  yandex:
+    # When false, Terraform skips the bridge module (no Yandex credentials required).
+    enabled: false
+    cloud_id: ""
+    folder_id: ""
+    zone: ru-central1-a
+    # Required when enabled: subnet with NAT route for the VM public IP
+    subnet_id: ""
+    create_vpc: false
+    instance_name: proxy-bridge
+
+ssh:
+  exit_user: root
+  exit_private_key_path: ~/.ssh/proxy_pipeline
+  bridge_user: ubuntu
+  bridge_private_key_path: ~/.ssh/proxy_pipeline
+
+panel:
+  port: "2053"
+  user: admin
+  # Set via env PROXY_PIPELINE_PANEL_PASS or pipeline.yaml (not recommended in git)
+  pass: ""
+  path: /secretpanel
+
+xray:
+  reality_sni: www.microsoft.com
+  reality_port: 443
+  ss_port: 8388
+  ss_method: 2022-blake3-aes-128-gcm
+  chain_port: 8443
+
+alerts:
+  telegram_bot_token: ""
+  telegram_chat_id: ""

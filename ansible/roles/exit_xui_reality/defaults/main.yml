@@ -1,0 +1,10 @@
+pipeline_state_dir: "{{ playbook_dir }}/../../state"
+panel_pass: ""
+panel_port: "2053"
+panel_user: admin
+panel_path: /secretpanel
+reality_sni: www.microsoft.com
+reality_port: 443
+ss_port: 8388
+ss_method: 2022-blake3-aes-128-gcm
+chain_port: 8443

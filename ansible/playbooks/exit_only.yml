@@ -1,0 +1,8 @@
+---
+- name: Configure Exit node only
+  hosts: exit
+  gather_facts: false
+  vars:
+    pipeline_state_dir: "{{ playbook_dir }}/../../state"
+  roles:
+    - role: exit_xui_reality

@@ -1,0 +1,87 @@
+---
+- name: Load Exit runtime state (controller)
+  ansible.builtin.include_vars:
+    file: "{{ pipeline_state_dir }}/runtime.json"
+    name: exit_state
+  delegate_to: localhost
+  run_once: true
+
+- name: Wait for SSH
+  ansible.builtin.wait_for_connection:
+    timeout: 300
+
+- name: Install Xray-core on Bridge
+  ansible.builtin.shell: |
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    if ! command -v xray >/dev/null 2>&1; then
+      bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    fi
+    mkdir -p /usr/local/etc/xray /var/log/xray
+  args: { executable: /bin/bash }
+
+- name: BBR sysctl on Bridge
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-bbr.conf
+    mode: "0644"
+    content: |
+      net.core.default_qdisc=fq
+      net.ipv4.tcp_congestion_control=bbr
+      net.ipv4.ip_forward=1
+
+- name: Apply sysctl
+  ansible.builtin.command: sysctl -p /etc/sysctl.d/99-bbr.conf
+  changed_when: false
+
+- name: Generate Bridge Reality keys
+  ansible.builtin.shell: xray x25519
+  register: bridge_x25519
+  changed_when: false
+
+- name: Parse Bridge keys
+  ansible.builtin.set_fact:
+    bridge_private_key: "{{ (bridge_x25519.stdout_lines | select('search', 'Private') | list | first).split() | last }}"
+    bridge_public_key: "{{ (bridge_x25519.stdout_lines | select('search', 'Public') | list | first).split() | last }}"
+
+- name: Bridge client UUID
+  ansible.builtin.set_fact:
+    bridge_client_uuid: "{{ lookup('pipe', 'cat /proc/sys/kernel/random/uuid') }}"
+
+- name: Bridge shortId
+  ansible.builtin.set_fact:
+    bridge_short_id: "{{ lookup('pipe', 'openssl rand -hex 4') }}"
+
+- name: Install Xray config
+  ansible.builtin.template:
+    src: xray.config.json.j2
+    dest: /usr/local/etc/xray/config.json
+    mode: "0644"
+  vars:
+    exit_ip: "{{ exit_state.exit_ip }}"
+    chain_port: "{{ exit_state.chain_port }}"
+    chain_uuid: "{{ exit_state.chain_uuid }}"
+    exit_public_key: "{{ exit_state.public_key }}"
+    exit_short_id: "{{ exit_state.short_id }}"
+    reality_sni: "{{ exit_state.reality_sni }}"
+    ss_method: "{{ exit_state.ss_method }}"
+    ss_password: "{{ exit_state.ss_password }}"
+    ss_port: "{{ exit_state.ss_port | int }}"
+
+- name: Enable and restart Xray
+  ansible.builtin.systemd:
+    name: xray
+    enabled: true
+    state: restarted
+
+- name: Wait for Xray on 443
+  ansible.builtin.wait_for:
+    port: 443
+    timeout: 60
+
+- name: Write bridge runtime for clients (controller)
+  ansible.builtin.template:
+    src: bridge_runtime.json.j2
+    dest: "{{ pipeline_state_dir }}/bridge_runtime.json"
+    mode: "0600"
+  delegate_to: localhost
+  run_once: true

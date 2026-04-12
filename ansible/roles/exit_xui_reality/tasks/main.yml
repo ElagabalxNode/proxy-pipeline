@@ -1,0 +1,417 @@
+---
+- name: Require panel password
+  ansible.builtin.fail:
+    msg: "Set panel_pass (extra var or vault). Refuse empty password."
+  when: panel_pass is not defined or (panel_pass | string | length) == 0
+
+- name: Wait for SSH
+  ansible.builtin.wait_for_connection:
+    timeout: 300
+
+- name: Wait for cloud-init marker
+  ansible.builtin.stat:
+    path: /opt/proxy-pipeline/.status
+  register: marker
+  until: marker.stat.exists | default(false)
+  retries: 60
+  delay: 5
+
+- name: Normalize panel path input
+  ansible.builtin.set_fact:
+    panel_path_clean: >-
+      {{ (panel_path | default('/') | string | trim)
+         | regex_replace('^/+', '')
+         | regex_replace('/+$', '') }}
+
+- name: Build panel path variants
+  ansible.builtin.set_fact:
+    panel_request_prefix: >-
+      {{ '' if panel_path_clean == '' else '/' ~ panel_path_clean }}
+    panel_web_base_path: >-
+      {{ '/' if panel_path_clean == '' else '/' ~ panel_path_clean ~ '/' }}
+    panel_ui_path: >-
+      {{ '/' if panel_path_clean == '' else '/' ~ panel_path_clean ~ '/' }}
+
+- name: Discover x-ui binary
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if [ -x /usr/local/x-ui/x-ui ]; then
+      echo /usr/local/x-ui/x-ui
+    else
+      echo "MISSING"
+    fi
+  args:
+    executable: /bin/bash
+  register: xui_bin_path
+  changed_when: false
+
+- name: Fail if x-ui not found
+  ansible.builtin.fail:
+    msg: "3X-UI binary not found on Exit (/usr/local/x-ui/x-ui missing)"
+  when: xui_bin_path.stdout is search("MISSING")
+
+- name: Reset 3X-UI bootstrap credentials
+  ansible.builtin.command:
+    argv:
+      - "{{ xui_bin_path.stdout | trim }}"
+      - setting
+      - -username
+      - admin
+      - -password
+      - admin
+  register: xui_bootstrap_user
+  changed_when: true
+  no_log: true
+
+- name: Reset 3X-UI bootstrap port
+  ansible.builtin.command:
+    argv:
+      - "{{ xui_bin_path.stdout | trim }}"
+      - setting
+      - -port
+      - "2053"
+  register: xui_bootstrap_port
+  changed_when: true
+
+- name: Reset 3X-UI bootstrap base path
+  ansible.builtin.command:
+    argv:
+      - "{{ xui_bin_path.stdout | trim }}"
+      - setting
+      - -webBasePath
+      - /
+  register: xui_bootstrap_path
+  changed_when: true
+
+- name: Restart x-ui after bootstrap reset
+  ansible.builtin.service:
+    name: x-ui
+    state: restarted
+
+- name: Wait for bootstrap panel port
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: 2053
+    timeout: 120
+  delegate_to: localhost
+  run_once: true
+
+- name: Discover xray binary for x25519
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if ls /usr/local/x-ui/bin/xray-linux-* 1>/dev/null 2>&1; then
+      ls /usr/local/x-ui/bin/xray-linux-* | head -1
+    elif command -v xray >/dev/null 2>&1; then
+      command -v xray
+    else
+      echo "MISSING"
+    fi
+  args: { executable: /bin/bash }
+  register: xray_bin_path
+  changed_when: false
+
+- name: Fail if xray not found
+  ansible.builtin.fail:
+    msg: "xray binary not found on Exit (3X-UI install incomplete)"
+  when: xray_bin_path.stdout is search("MISSING")
+
+- name: Generate Reality x25519 keypair
+  ansible.builtin.command: "{{ xray_bin_path.stdout | trim }} x25519"
+  register: x25519_out
+  changed_when: false
+
+- name: Normalize x25519 output to JSON
+  ansible.builtin.shell: |
+    set -euo pipefail
+    XRAY_OUTPUT=$(cat <<'EOF'
+    {{ x25519_out.stdout }}
+    EOF
+    )
+    XRAY_OUTPUT="$XRAY_OUTPUT" python3 - <<'PY'
+    import json
+    import os
+    import re
+
+    output = os.environ.get("XRAY_OUTPUT", "")
+
+    def extract(pattern: str) -> str:
+        match = re.search(pattern, output, flags=re.MULTILINE | re.IGNORECASE)
+        return match.group(1).strip() if match else ""
+
+    payload = {
+        "private_key": extract(r"^Private(?:Key)?\s*:\s*(\S+)"),
+        "public_key": extract(r"^(?:Public(?:\s+Key)?|Password(?:\s+\(PublicKey\))?)\s*:\s*(\S+)"),
+        "raw": output,
+    }
+
+    print(json.dumps(payload))
+    PY
+  args:
+    executable: /bin/bash
+  register: x25519_parsed
+  changed_when: false
+
+- name: Parse x25519 keys
+  ansible.builtin.set_fact:
+    reality_private_key: "{{ (x25519_parsed.stdout | from_json).private_key | default('') }}"
+    reality_public_key: "{{ (x25519_parsed.stdout | from_json).public_key | default('') }}"
+
+- name: Fail if keys empty
+  ansible.builtin.fail:
+    msg: "Could not parse x25519 output: {{ (x25519_parsed.stdout | from_json).raw | default(x25519_out.stdout | default('')) }}"
+  when: reality_private_key | length < 10 or reality_public_key | length < 10
+
+- name: Generate identifiers
+  ansible.builtin.set_fact:
+    vless_uuid: "{{ lookup('pipe', 'cat /proc/sys/kernel/random/uuid') }}"
+    reality_short_id: "{{ lookup('pipe', 'openssl rand -hex 4') }}"
+    ss_password: "{{ lookup('pipe', 'openssl rand -base64 18 | tr -d \"\\n\"') }}"
+    chain_uuid: "{{ lookup('pipe', 'cat /proc/sys/kernel/random/uuid') }}"
+
+- name: Ensure state directory on controller
+  ansible.builtin.file:
+    path: "{{ pipeline_state_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  run_once: true
+
+- name: Write cookie jar path fact
+  ansible.builtin.set_fact:
+    cookie_jar: "{{ pipeline_state_dir }}/.3x-ui-cookies.txt"
+
+- name: Login to bootstrap 3X-UI session
+  ansible.builtin.shell: |
+    set -euo pipefail
+    rm -f "{{ cookie_jar }}"
+    curl -sS -c "{{ cookie_jar }}" -X POST \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      --data-urlencode "username=admin" \
+      --data-urlencode "password=admin" \
+      "http://{{ ansible_host }}:2053/login" \
+      | tee "{{ pipeline_state_dir }}/.login.json"
+    python3 - <<'PY'
+    import json
+    d=json.load(open("{{ pipeline_state_dir }}/.login.json"))
+    assert d.get("success") is True, d
+    PY
+  args:
+    executable: /bin/bash
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+
+- name: Update panel port and web base path
+  ansible.builtin.shell: |
+    set -euo pipefail
+    curl -sS -b "{{ cookie_jar }}" -X POST \
+      "http://{{ ansible_host }}:2053/panel/setting/all" \
+      | tee "{{ pipeline_state_dir }}/.panel-settings-current.json"
+    python3 - <<'PY'
+    import json
+    import urllib.parse
+
+    current = json.load(open("{{ pipeline_state_dir }}/.panel-settings-current.json"))
+    assert current.get("success") is True, current
+
+    payload = current.get("obj") or {}
+    payload["webPort"] = int("{{ panel_port }}")
+    payload["webBasePath"] = "{{ panel_web_base_path }}"
+
+    def normalize(value):
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if value is None:
+            return ""
+        return str(value)
+
+    encoded = urllib.parse.urlencode(
+        {key: normalize(value) for key, value in payload.items()},
+        doseq=False,
+    )
+    with open("{{ pipeline_state_dir }}/.panel-settings.form", "w", encoding="utf-8") as handle:
+        handle.write(encoded)
+    PY
+    curl -sS -b "{{ cookie_jar }}" -X POST \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      --data-binary @"{{ pipeline_state_dir }}/.panel-settings.form" \
+      "http://{{ ansible_host }}:2053/panel/setting/update" \
+      | tee "{{ pipeline_state_dir }}/.panel-settings.json"
+    python3 - <<'PY'
+    import json
+    d=json.load(open("{{ pipeline_state_dir }}/.panel-settings.json"))
+    assert d.get("success") is True, d
+    PY
+  args:
+    executable: /bin/bash
+  delegate_to: localhost
+  run_once: true
+
+- name: Update panel admin credentials
+  ansible.builtin.shell: |
+    set -euo pipefail
+    curl -sS -b "{{ cookie_jar }}" -X POST \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      --data-urlencode "oldUsername=admin" \
+      --data-urlencode "oldPassword=admin" \
+      --data-urlencode "newUsername={{ panel_user }}" \
+      --data-urlencode "newPassword={{ panel_pass }}" \
+      "http://{{ ansible_host }}:2053/panel/setting/updateUser" \
+      | tee "{{ pipeline_state_dir }}/.panel-user.json"
+    python3 - <<'PY'
+    import json
+    d=json.load(open("{{ pipeline_state_dir }}/.panel-user.json"))
+    assert d.get("success") is True, d
+    PY
+  args:
+    executable: /bin/bash
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+
+- name: Restart panel after settings update
+  ansible.builtin.shell: |
+    set -euo pipefail
+    curl -sS -b "{{ cookie_jar }}" -X POST \
+      "http://{{ ansible_host }}:2053/panel/setting/restartPanel" \
+      | tee "{{ pipeline_state_dir }}/.panel-restart.json"
+    python3 - <<'PY'
+    import json
+    d=json.load(open("{{ pipeline_state_dir }}/.panel-restart.json"))
+    assert d.get("success") is True, d
+    PY
+  args:
+    executable: /bin/bash
+  delegate_to: localhost
+  run_once: true
+
+- name: Wait for final panel port
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ panel_port | int }}"
+    timeout: 120
+  delegate_to: localhost
+  run_once: true
+
+- name: Login to configured 3X-UI session
+  ansible.builtin.shell: |
+    set -euo pipefail
+    rm -f "{{ cookie_jar }}"
+    curl -sS -c "{{ cookie_jar }}" -X POST \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      --data-urlencode "username={{ panel_user }}" \
+      --data-urlencode "password={{ panel_pass }}" \
+      "http://{{ ansible_host }}:{{ panel_port }}{{ panel_request_prefix }}/login" \
+      | tee "{{ pipeline_state_dir }}/.login-final.json"
+    python3 - <<'PY'
+    import json
+    d=json.load(open("{{ pipeline_state_dir }}/.login-final.json"))
+    assert d.get("success") is True, d
+    PY
+  args:
+    executable: /bin/bash
+  register: final_panel_login
+  retries: 12
+  delay: 5
+  until: final_panel_login.rc == 0
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+
+- name: Build inbound JSON payloads (jq)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    case "{{ item.name }}" in
+      vless_reality)
+        jq -n \
+          --arg uuid "{{ vless_uuid }}" \
+          --arg pk "{{ reality_private_key }}" \
+          --arg sni "{{ reality_sni }}" \
+          --arg sid "{{ reality_short_id }}" \
+          --argjson sniff '{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}' \
+          --argjson port {{ reality_port | int }} \
+          '{
+            up:0, down:0, total:0, remark:"VLESS-Reality-Vision", enable:true, expiryTime:0, listen:"",
+            port: $port, protocol:"vless",
+            settings: ({clients:[{id:$uuid,flow:"xtls-rprx-vision",email:"main",limitIp:0,totalGB:0,expiryTime:0,enable:true,subId:"main"}],decryption:"none",fallbacks:[]} | tostring),
+            streamSettings: ({network:"tcp",security:"reality",realitySettings:{show:false,xver:0,dest:($sni+":443"),serverNames:[$sni],privateKey:$pk,shortIds:[$sid]},tcpSettings:{acceptProxyProtocol:false,header:{type:"none"}}} | tostring),
+            sniffing: ($sniff | tostring)
+          }' > "{{ pipeline_state_dir }}/.payload-{{ item.name }}.json"
+        ;;
+      shadowsocks2022)
+        jq -n \
+          --arg method "{{ ss_method }}" \
+          --arg pass "{{ ss_password }}" \
+          --argjson sniff '{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}' \
+          --argjson port {{ ss_port | int }} \
+          '{
+            up:0, down:0, total:0, remark:"SS2022-Fallback", enable:true, expiryTime:0, listen:"",
+            port: $port, protocol:"shadowsocks",
+            settings: ({method:$method,password:$pass,network:"tcp,udp",clients:[]} | tostring),
+            streamSettings: ({"network":"tcp","security":"none","tcpSettings":{"acceptProxyProtocol":false,"header":{"type":"none"}}} | tostring),
+            sniffing: ($sniff | tostring)
+          }' > "{{ pipeline_state_dir }}/.payload-{{ item.name }}.json"
+        ;;
+      chain_xhttp)
+        jq -n \
+          --arg uuid "{{ chain_uuid }}" \
+          --arg pk "{{ reality_private_key }}" \
+          --arg sni "{{ reality_sni }}" \
+          --arg sid "{{ reality_short_id }}" \
+          --argjson sniff '{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}' \
+          --argjson port {{ chain_port | int }} \
+          '{
+            up:0, down:0, total:0, remark:"Chain-Bridge-Entry", enable:true, expiryTime:0, listen:"",
+            port: $port, protocol:"vless",
+            settings: ({clients:[{id:$uuid,flow:"",email:"bridge-relay",limitIp:0,totalGB:0,expiryTime:0,enable:true,subId:"bridge"}],decryption:"none",fallbacks:[]} | tostring),
+            streamSettings: ({network:"xhttp",security:"reality",realitySettings:{show:false,xver:0,dest:($sni+":443"),serverNames:[$sni],privateKey:$pk,shortIds:[$sid]},xhttpSettings:{mode:"auto",path:"/chain-relay"}} | tostring),
+            sniffing: ($sniff | tostring)
+          }' > "{{ pipeline_state_dir }}/.payload-{{ item.name }}.json"
+        ;;
+    esac
+  args: { executable: /bin/bash }
+  loop:
+    - { name: vless_reality }
+    - { name: shadowsocks2022 }
+    - { name: chain_xhttp }
+  delegate_to: localhost
+  run_once: true
+
+- name: Submit inbounds to 3X-UI
+  ansible.builtin.shell: |
+    set -euo pipefail
+    curl -sS -b "{{ cookie_jar }}" -H "Content-Type: application/json" \
+      -d @"{{ pipeline_state_dir }}/.payload-{{ item.name }}.json" \
+      "http://{{ ansible_host }}:{{ panel_port }}{{ panel_request_prefix }}/panel/api/inbounds/add" \
+      | tee "{{ pipeline_state_dir }}/.inbound-{{ item.name }}.resp.json"
+    python3 - <<'PY'
+    import json
+    d=json.load(open("{{ pipeline_state_dir }}/.inbound-{{ item.name }}.resp.json"))
+    assert d.get("success") is True, d
+    PY
+  args:
+    executable: /bin/bash
+  loop:
+    - { name: vless_reality }
+    - { name: shadowsocks2022 }
+    - { name: chain_xhttp }
+  delegate_to: localhost
+  run_once: true
+
+- name: Render runtime state for Bridge and tools
+  ansible.builtin.template:
+    src: runtime.json.j2
+    dest: "{{ pipeline_state_dir }}/runtime.json"
+    mode: "0600"
+  delegate_to: localhost
+  run_once: true
+
+- name: Verify listening ports on Exit
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ item }}"
+    timeout: 120
+  loop:
+    - "{{ reality_port | int }}"
+    - "{{ ss_port | int }}"
+    - "{{ chain_port | int }}"

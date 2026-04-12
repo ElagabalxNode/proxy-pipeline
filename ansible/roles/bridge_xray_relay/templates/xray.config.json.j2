@@ -1,0 +1,129 @@
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
+  },
+  "dns": {
+    "servers": [
+      "https+local://1.1.1.1/dns-query",
+      "localhost"
+    ]
+  },
+  "inbounds": [
+    {
+      "tag": "vless-reality-in",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "{{ bridge_client_uuid }}",
+            "flow": "xtls-rprx-vision",
+            "email": "client-via-bridge"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "{{ reality_sni }}:443",
+          "xver": 0,
+          "serverNames": ["{{ reality_sni }}"],
+          "privateKey": "{{ bridge_private_key }}",
+          "shortIds": ["{{ bridge_short_id }}"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    },
+    {
+      "tag": "ss2022-in",
+      "listen": "0.0.0.0",
+      "port": {{ ss_port | int }},
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "{{ ss_method }}",
+        "password": "{{ ss_password }}",
+        "network": "tcp,udp"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "chain-to-exit",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "{{ exit_ip }}",
+            "port": {{ chain_port | int }},
+            "users": [
+              {
+                "id": "{{ chain_uuid }}",
+                "encryption": "none",
+                "flow": ""
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "fingerprint": "chrome",
+          "serverName": "{{ reality_sni }}",
+          "publicKey": "{{ exit_public_key }}",
+          "shortId": "{{ exit_short_id }}",
+          "spiderX": ""
+        },
+        "xhttpSettings": {
+          "mode": "auto",
+          "path": "/chain-relay"
+        }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {}
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole",
+      "settings": {}
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "outboundTag": "block",
+        "protocol": ["bittorrent"]
+      },
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "ip": ["geoip:private"]
+      },
+      {
+        "type": "field",
+        "outboundTag": "chain-to-exit",
+        "port": "0-65535"
+      }
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+---
+# Full chain: Exit (3X-UI + inbounds) then Bridge (xray-core).
+# pipelinectl writes inventory/hosts.ini (must include [bridge] when Yandex bridge exists).
+
+- name: Configure Exit node
+  hosts: exit
+  gather_facts: false
+  vars:
+    pipeline_state_dir: "{{ playbook_dir }}/../../state"
+  roles:
+    - role: exit_xui_reality
+
+- name: Configure Bridge node
+  hosts: bridge
+  gather_facts: false
+  vars:
+    pipeline_state_dir: "{{ playbook_dir }}/../../state"
+  roles:
+    - role: bridge_xray_relay

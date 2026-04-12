@@ -1,0 +1,18 @@
+{
+  "exit_ip": "{{ ansible_host }}",
+  "panel_url": "http://{{ ansible_host }}:{{ panel_port }}{{ panel_ui_path }}",
+  "panel_user": "{{ panel_user }}",
+  "panel_port": "{{ panel_port }}",
+  "panel_path": "{{ panel_request_prefix }}",
+  "uuid": "{{ vless_uuid }}",
+  "private_key": "{{ reality_private_key }}",
+  "public_key": "{{ reality_public_key }}",
+  "short_id": "{{ reality_short_id }}",
+  "reality_sni": "{{ reality_sni }}",
+  "reality_port": {{ reality_port | int }},
+  "ss_password": "{{ ss_password }}",
+  "ss_method": "{{ ss_method }}",
+  "ss_port": {{ ss_port | int }},
+  "chain_uuid": "{{ chain_uuid }}",
+  "chain_port": {{ chain_port | int }}
+}
