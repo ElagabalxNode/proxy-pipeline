@@ -4,6 +4,20 @@
     msg: "Set panel_pass (extra var or vault). Refuse empty password."
   when: panel_pass is not defined or (panel_pass | string | length) == 0
 
+- name: Require reality_sni (must come from probe-targets, not defaults)
+  ansible.builtin.fail:
+    msg: >
+      reality_sni is empty. Run 'pipelinectl probe-targets' before 'configure'.
+      Configure reads state/reality_target.json and passes reality_sni + reality_dest
+      as extra vars. Using a hardcoded default is intentionally forbidden.
+  when: reality_sni is not defined or (reality_sni | string | trim | length) == 0
+
+- name: Require reality_dest (must come from probe-targets)
+  ansible.builtin.fail:
+    msg: >
+      reality_dest is empty. Run 'pipelinectl probe-targets' before 'configure'.
+  when: reality_dest is not defined or (reality_dest | string | trim | length) == 0
+
 - name: Wait for SSH
   ansible.builtin.wait_for_connection:
     timeout: 300
@@ -327,6 +341,7 @@
           --arg uuid "{{ vless_uuid }}" \
           --arg pk "{{ reality_private_key }}" \
           --arg sni "{{ reality_sni }}" \
+          --arg dest "{{ reality_dest }}" \
           --arg sid "{{ reality_short_id }}" \
           --argjson sniff '{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}' \
           --argjson port {{ reality_port | int }} \
@@ -334,7 +349,7 @@
             up:0, down:0, total:0, remark:"VLESS-Reality-Vision", enable:true, expiryTime:0, listen:"",
             port: $port, protocol:"vless",
             settings: ({clients:[{id:$uuid,flow:"xtls-rprx-vision",email:"main",limitIp:0,totalGB:0,expiryTime:0,enable:true,subId:"main"}],decryption:"none",fallbacks:[]} | tostring),
-            streamSettings: ({network:"tcp",security:"reality",realitySettings:{show:false,xver:0,dest:($sni+":443"),serverNames:[$sni],privateKey:$pk,shortIds:[$sid]},tcpSettings:{acceptProxyProtocol:false,header:{type:"none"}}} | tostring),
+            streamSettings: ({network:"tcp",security:"reality",realitySettings:{show:false,xver:0,dest:$dest,serverNames:[$sni],privateKey:$pk,shortIds:[$sid]},tcpSettings:{acceptProxyProtocol:false,header:{type:"none"}}} | tostring),
             sniffing: ($sniff | tostring)
           }' > "{{ pipeline_state_dir }}/.payload-{{ item.name }}.json"
         ;;
@@ -357,6 +372,7 @@
           --arg uuid "{{ chain_uuid }}" \
           --arg pk "{{ reality_private_key }}" \
           --arg sni "{{ reality_sni }}" \
+          --arg dest "{{ reality_dest }}" \
           --arg sid "{{ reality_short_id }}" \
           --argjson sniff '{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}' \
           --argjson port {{ chain_port | int }} \
@@ -364,7 +380,7 @@
             up:0, down:0, total:0, remark:"Chain-Bridge-Entry", enable:true, expiryTime:0, listen:"",
             port: $port, protocol:"vless",
             settings: ({clients:[{id:$uuid,flow:"",email:"bridge-relay",limitIp:0,totalGB:0,expiryTime:0,enable:true,subId:"bridge"}],decryption:"none",fallbacks:[]} | tostring),
-            streamSettings: ({network:"xhttp",security:"reality",realitySettings:{show:false,xver:0,dest:($sni+":443"),serverNames:[$sni],privateKey:$pk,shortIds:[$sid]},xhttpSettings:{mode:"auto",path:"/chain-relay"}} | tostring),
+            streamSettings: ({network:"xhttp",security:"reality",realitySettings:{show:false,xver:0,dest:$dest,serverNames:[$sni],privateKey:$pk,shortIds:[$sid]},xhttpSettings:{mode:"auto",path:"/chain-relay"}} | tostring),
             sniffing: ($sniff | tostring)
           }' > "{{ pipeline_state_dir }}/.payload-{{ item.name }}.json"
         ;;

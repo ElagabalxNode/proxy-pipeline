@@ -45,3 +45,33 @@ def bridge_ssh_user(cfg: dict[str, Any]) -> str:
 def panel_pass(cfg: dict[str, Any]) -> str:
     v = os.environ.get("PROXY_PIPELINE_PANEL_PASS") or str(cfg.get("panel", {}).get("pass", ""))
     return v
+
+
+def _telegram_section(cfg: dict[str, Any]) -> dict[str, Any]:
+    sec = cfg.get("telegram")
+    return sec if isinstance(sec, dict) else {}
+
+
+def telegram_bot_token(cfg: dict[str, Any]) -> str:
+    return (
+        os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        or str(_telegram_section(cfg).get("bot_token") or "").strip()
+    )
+
+
+def telegram_notify_chat_id(cfg: dict[str, Any]) -> str:
+    raw = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID") or _telegram_section(cfg).get("notify_chat_id")
+    return str(raw or "").strip()
+
+
+def telegram_allowed_user_ids(cfg: dict[str, Any]) -> list[int]:
+    raw = _telegram_section(cfg).get("allowed_user_ids") or []
+    out: list[int] = []
+    if not isinstance(raw, list):
+        return out
+    for x in raw:
+        try:
+            out.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    return out

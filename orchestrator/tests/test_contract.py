@@ -15,6 +15,8 @@ def test_example_pipeline_yaml_parses() -> None:
     assert data.get("version") == 1
     assert "paths" in data
     assert "providers" in data
+    assert "telegram" in data
+    assert "allowed_user_ids" in data["telegram"]
 
 
 def test_docs_mention_contract_outputs() -> None:

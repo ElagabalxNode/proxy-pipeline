@@ -45,3 +45,10 @@ xray:
 alerts:
   telegram_bot_token: ""
   telegram_chat_id: ""
+
+# Optional: Telegram control plane (install orchestrator with pip install -e ".[telegram]").
+telegram:
+  bot_token: "" # or env TELEGRAM_BOT_TOKEN
+  allowed_user_ids: [] # Telegram user ids allowed to use /status, /validate, …
+  notify_chat_id: "" # target for pipelinectl notify and future watchdog alerts
+`

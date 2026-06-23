@@ -1,0 +1,175 @@
+version: 1
+
+# Как использовать:
+# pipelinectl probe-targets выбирает лучший target из этого списка
+# для конкретного Exit VPS после provision.
+# Критерии отбора: TLS 1.3, без ECH, без Cloudflare-dest,
+# стабильный хендшейк, низкий RTT с VPS.
+
+targets:
+
+  # ─── Tier 1: Проверенные, стабильные, рекомендованы для большинства EU-регионов ───
+
+  - id: microsoft-www
+    sni: www.microsoft.com
+    dest: www.microsoft.com:443
+    port: 443
+    expected_alpn: [h2, http/1.1]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt, LT-Siauliai]
+    notes: >
+      Дефолт из документации. Очень стабилен, Microsoft CDN (Akamai/Azure)
+      хорошо покрывает всю Европу. Слишком популярен — высокий приоритет
+      замены после появления pattern-detection в ТСПУ.
+    enabled: true
+    priority: 2
+
+  - id: addons-mozilla
+    sni: addons.mozilla.org
+    dest: addons.mozilla.org:443
+    port: 443
+    expected_alpn: [h2]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt]
+    notes: >
+      Mozilla CDN (AWS CloudFront). TLS 1.3, без ECH. Хороший выбор
+      для NL/DE — CDN-нода физически близко. Некоммерческая организация,
+      трафик к ней выглядит органично с EU-IP.
+    enabled: true
+    priority: 1
+
+  - id: logitech-www
+    sni: www.logitech.com
+    dest: www.logitech.com:443
+    port: 443
+    expected_alpn: [h2, http/1.1]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt, LT-Siauliai]
+    notes: >
+      Корпоративный сайт. TLS 1.3, CDN Akamai. Не перегружен как target.
+      Швейцарская компания — хорошая репутация. Рекомендован в нескольких
+      EU-регионах как малоизвестный но стабильный кандидат.
+    enabled: true
+    priority: 1
+
+  - id: apple-www
+    sni: www.apple.com
+    dest: www.apple.com:443
+    port: 443
+    expected_alpn: [h2]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt]
+    notes: >
+      Apple CDN (Akamai). TLS 1.3, без ECH. Отличная репутация домена,
+      EU-ноды Akamai хорошо видны из Stockholm/Amsterdam.
+      Трафик к Apple органичен с любого EU-IP.
+    enabled: true
+    priority: 1
+
+  - id: download-docker
+    sni: download.docker.com
+    dest: download.docker.com:443
+    port: 443
+    expected_alpn: [h2, http/1.1]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt]
+    notes: >
+      Docker CDN. Нетипичный target — никто не ожидает маскировки
+      под docker registry. TLS 1.3. Трафик с EU datacenter IP
+      к docker.com выглядит полностью органично (серверы же скачивают образы).
+    enabled: true
+    priority: 1
+
+  - id: cdn-kernel-org
+    sni: cdn.kernel.org
+    dest: cdn.kernel.org:443
+    port: 443
+    expected_alpn: [h2, http/1.1]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt]
+    notes: >
+      Linux Kernel CDN. Трафик с datacenter IP абсолютно органичен
+      (серверы скачивают ядра). Хороший TLS. Нетипичный и малоизвестный target.
+    enabled: true
+    priority: 1
+
+  - id: nvidia-www
+    sni: www.nvidia.com
+    dest: www.nvidia.com:443
+    port: 443
+    expected_alpn: [h2]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt, US-Chicago]
+    notes: >
+      NVIDIA CDN (Akamai). TLS 1.3, хороший хендшейк.
+      Нейтральный корпоративный трафик, не под прицелом ТСПУ.
+    enabled: true
+    priority: 1
+
+  - id: amd-www
+    sni: www.amd.com
+    dest: www.amd.com:443
+    port: 443
+    expected_alpn: [h2, http/1.1]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt, US-Chicago]
+    notes: >
+      AMD CDN. Стабильный корпоративный target. Мало используется как
+      Reality dest, что снижает риск pattern-detection.
+    enabled: true
+    priority: 1
+
+  # ─── Tier 2: Рабочие, но с оговорками ───
+
+  - id: bing-www
+    sni: www.bing.com
+    dest: www.bing.com:443
+    port: 443
+    expected_alpn: [h2]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt, US-Chicago]
+    notes: >
+      Microsoft (Azure CDN). TLS 1.3. Работает, но Microsoft уже
+      есть в Tier 1 через www.microsoft.com. Используй как backup.
+    enabled: true
+    priority: 2
+
+  - id: samsung-www
+    sni: www.samsung.com
+    dest: www.samsung.com:443
+    port: 443
+    expected_alpn: [h2]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt]
+    notes: >
+      Samsung CDN. Иногда даёт HTTP/3 вместо h2, проверяй ALPN при probe.
+      Рабочий, но менее предсказуемый чем Tier 1.
+    enabled: true
+    priority: 2
+
+  - id: speedtest-net
+    sni: www.speedtest.net
+    dest: www.speedtest.net:443
+    port: 443
+    expected_alpn: [h2]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt]
+    notes: >
+      Ookla CDN. TLS 1.3. Трафик к speedtest с datacenter IP органичен.
+      Иногда меняет TLS-конфиг — нужна регулярная проверка.
+    enabled: false
+    priority: 3
+
+  # ─── Tier 3: Только как emergency fallback ───
+
+  - id: github-www
+    sni: github.com
+    dest: github.com:443
+    port: 443
+    expected_alpn: [h2]
+    regions: [SE-Stockholm, NL-Amsterdam, DE-Frankfurt, US-Chicago, LT-Siauliai]
+    notes: >
+      Широко известен как Reality target — высокий риск pattern-detection.
+      Использовать только если всё остальное не работает.
+    enabled: false
+    priority: 3
+
+  - id: yahoo-www
+    sni: www.yahoo.com
+    dest: www.yahoo.com:443
+    port: 443
+    expected_alpn: [h2]
+    regions: [US-Chicago]
+    notes: >
+      Рабочий target для US-регионов. Не использовать для EU.
+    enabled: false
+    priority: 3

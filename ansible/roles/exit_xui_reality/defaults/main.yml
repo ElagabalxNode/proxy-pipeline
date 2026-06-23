@@ -3,7 +3,10 @@ panel_pass: ""
 panel_port: "2053"
 panel_user: admin
 panel_path: /secretpanel
-reality_sni: www.microsoft.com
+# reality_sni and reality_dest MUST be supplied by pipelinectl configure (from state/reality_target.json).
+# There is no default: configure fails if probe-targets has not been run first.
+reality_sni: ""
+reality_dest: ""
 reality_port: 443
 ss_port: 8388
 ss_method: 2022-blake3-aes-128-gcm
