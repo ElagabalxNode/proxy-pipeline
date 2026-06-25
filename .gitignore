@@ -31,11 +31,16 @@ state/
 # --- Terraform ---
 terraform/*.tfstate
 terraform/*.tfstate.*
+terraform/**/*.tfstate
+terraform/**/*.tfstate.*
 terraform/.terraform/
+terraform/**/.terraform/
 terraform/.terraform.lock.hcl
 terraform/terraform.tfvars
 terraform/*.auto.tfvars
 terraform/*.auto.tfvars.json
+# Ephemeral Timeweb probe scratch dir (abandoned methodology; holds throwaway tfstate)
+terraform/probe/
 
 # --- Ansible ---
 ansible/inventory/hosts.ini

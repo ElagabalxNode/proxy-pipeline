@@ -58,7 +58,8 @@ state/                      # локальные runtime-артефакты (git
 Root stack поднимает:
 
 - модуль `exit_cherry`
-- модуль `bridge_yandex` только если `enable_yandex_bridge=true`
+- модуль `bridge_timeweb` если `enable_timeweb_bridge=true` (рекомендуемый RU-бридж)
+- модуль `bridge_yandex` если `enable_yandex_bridge=true` (legacy / fallback)
 
 Ключевые outputs:
 
@@ -139,15 +140,25 @@ pipelinectl links --no-export
 
 ### 5. Rotate
 
-`pipelinectl rotate` пересоздаёт целевую ноду через Terraform и затем повторяет `configure`.
-
-Поддерживается:
+`pipelinectl rotate` пересоздаёт ноды и сразу перевыпускает ссылки/QR — тонкая обёртка над
+`scripts/rotate-chain.sh` (одна команда на всю ротацию). Делает: активацию `.venv`, Yandex-auth
+из `config/key.json`, защиту от мёртвого Timeweb в стейте и несовместимого с регионом плана,
+`terraform apply -replace`, ожидание SSH, ре-пробу Reality, `configure` и `links --qr`.
 
 ```bash
-pipelinectl rotate exit
-pipelinectl rotate bridge
-pipelinectl rotate all
+pipelinectl rotate all                  # Exit + YC-мост (по умолчанию)
+pipelinectl rotate exit                 # только Exit
+pipelinectl rotate bridge               # только мост
+pipelinectl rotate all --region SE-Stockholm --plan B2-1-1gb-20s-shared   # со сменой региона
+pipelinectl rotate all --yes            # без интерактивного подтверждения terraform
+
+# Эквивалентно напрямую:
+scripts/rotate-chain.sh all
 ```
+
+По умолчанию `terraform apply` спрашивает подтверждение один раз. В конце печатается новый QR —
+клиенту отдавать `.client-links-qr/bridge_vless.png`. Подробности и ручные фазы:
+[`docs/RUNBOOK-ROTATE-CHAIN.md`](docs/RUNBOOK-ROTATE-CHAIN.md).
 
 ## Быстрый старт
 
@@ -180,7 +191,23 @@ export TF_VAR_panel_pass="..."
 export PROXY_PIPELINE_PANEL_PASS="$TF_VAR_panel_pass"
 ```
 
-Опционально для Yandex Bridge:
+Опционально для Timeweb Bridge (рекомендуемый RU-бридж, дешевле Yandex):
+
+```bash
+export TWC_TOKEN="..."   # панель Timeweb -> «API и Terraform»
+```
+
+В `terraform/terraform.tfvars`:
+
+```hcl
+enable_timeweb_bridge         = true
+timeweb_configurator_location = "ru-2"   # ru-1=СПб, ru-2=Москва
+timeweb_availability_zone     = "msk-1"  # "" если аккаунт не даёт выбрать зону
+```
+
+⚠️ У токена Timeweb включите «удалять сервисы по API без кода в Телеграме», иначе `terraform destroy` / `pipelinectl rotate` зависнут. Подробный ранбук миграции: [`docs/RUNBOOK-TIMEWEB.md`](docs/RUNBOOK-TIMEWEB.md).
+
+Опционально для Yandex Bridge (legacy / fallback):
 
 ```bash
 export YC_TOKEN="..."
@@ -197,7 +224,7 @@ yandex_subnet_id     = "..."
 yandex_zone          = "ru-central1-a"
 ```
 
-Важно: модуль Bridge сейчас ожидает **готовый subnet с NAT / внешним доступом**. Создание VPC и security group автоматически ещё не добавлено.
+Важно: модуль Yandex Bridge ожидает **готовый subnet с NAT / внешним доступом** (Timeweb-модуль этого не требует — публичный IP выдаётся серверу). Создание VPC и security group автоматически ещё не добавлено.
 
 ### 4. Установите `pipelinectl`
 
@@ -238,6 +265,7 @@ pipelinectl links
 - `exit_region`
 - `exit_plan`
 - `exit_image`
+- `enable_timeweb_bridge`, `timeweb_configurator_location`, `timeweb_availability_zone`, `timeweb_cpu`, `timeweb_ram_mb`, `timeweb_disk_mb`
 - `enable_yandex_bridge`
 - `yandex_folder_id`
 - `yandex_subnet_id`
@@ -258,7 +286,19 @@ pipelinectl links
 
 ### Bridge
 
-Модуль [`terraform/modules/bridge_yandex`](terraform/modules/bridge_yandex):
+Два взаимозаменяемых модуля, выбираются флагами `enable_*_bridge`. Оба отдают
+одинаковые outputs (`external_ip`, `instance_id`, `ssh_user`), поэтому роль
+`bridge_xray_relay`, `configure`/`validate`/`links` от провайдера не зависят. В
+outputs Timeweb приоритетнее Yandex (полезно при бесшовном переключении).
+
+Модуль [`terraform/modules/bridge_timeweb`](terraform/modules/bridge_timeweb) — RU-бридж на Timeweb Cloud (рекомендуемый):
+
+- `twc_server.bridge` + `twc_ssh_key.bridge`
+- размер через `configuration { configurator_id, cpu, ram, disk }` (ram/disk в МБ)
+- публичный IPv4 — `main_ipv4` (отдельный платный ресурс у Timeweb, выдаётся серверу)
+- SSH user `root`
+
+Модуль [`terraform/modules/bridge_yandex`](terraform/modules/bridge_yandex) — legacy / fallback:
 
 - `yandex_compute_instance.bridge`
 - Ubuntu image family

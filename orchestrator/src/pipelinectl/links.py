@@ -37,8 +37,9 @@ def build_direct_ss(d: dict[str, Any]) -> str:
 def build_bridge_vless(d: dict[str, Any]) -> str | None:
     if not d.get("bridge_ip"):
         return None
+    port = d.get("bridge_reality_port") or 443
     return (
-        f"vless://{d['bridge_uuid']}@{d['bridge_ip']}:443?encryption=none&flow=xtls-rprx-vision"
+        f"vless://{d['bridge_uuid']}@{d['bridge_ip']}:{port}?encryption=none&flow=xtls-rprx-vision"
         f"&security=reality&sni={d['reality_sni']}&fp=chrome&pbk={d['bridge_public_key']}&sid={d['bridge_short_id']}"
         f"&type=tcp&headerType=none#Bridge-VLESS-{d['bridge_ip']}"
     )

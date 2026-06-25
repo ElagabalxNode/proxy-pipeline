@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,9 +27,38 @@ def provision() -> None:
     terraform.terraform_apply(tf_dir)
 
 
-@app.command()
-def configure() -> None:
-    """Write Ansible inventory from Terraform outputs and run playbooks."""
+def _bridge_chain_mode(tf_dir: Path) -> str:
+    """Pick how the bridge relays to the Exit, by active provider.
+
+    Timeweb's egress network breaks the xhttp/HTTP-2 chain to Exit:CHAIN_PORT (and vision
+    must not be used on a relay hop), so a Timeweb bridge relays via Shadowsocks-2022 to
+    the Exit's existing SS inbound (mode "ss", no Exit change). Yandex keeps "xhttp".
+    Detected from Terraform state so it's automatic.
+    """
+    try:
+        state = terraform.terraform_state_list(tf_dir)
+    except Exception:  # noqa: BLE001
+        return "xhttp"
+    if any(a.endswith(".twc_server.bridge") for a in state):
+        return "ss"
+    return "xhttp"
+
+
+def _do_configure(
+    bridge_only: bool = False,
+    bridge_ip_override: str | None = None,
+    bridge_user_override: str | None = None,
+) -> None:
+    """Write inventory from Terraform outputs and run Ansible.
+
+    bridge_only=True runs site.yml limited to the [bridge] group, so the Exit play
+    has no hosts and is skipped — the live Exit is never touched. The bridge role
+    reads all Exit details from state/runtime.json, so no extra_vars are needed.
+
+    bridge_ip_override / bridge_user_override bypass the Terraform outputs for the
+    bridge — useful right after a `-target` apply, whose root outputs are NOT
+    refreshed (they still show the previously-active bridge).
+    """
     cfg = _cfg()
     tf_dir = paths.terraform_dir(cfg)
     adir = paths.ansible_dir(cfg)
@@ -39,9 +68,11 @@ def configure() -> None:
     if not exit_ip:
         typer.secho("terraform output exit_ip is empty — apply Terraform first.", fg=typer.colors.RED)
         raise typer.Exit(1)
-    bridge_ip = (outs.get("bridge_ip") or "").strip() or None
+    bridge_ip = (bridge_ip_override or "").strip() or (outs.get("bridge_ip") or "").strip() or None
     bridge_user_tf = (outs.get("bridge_ssh_user") or "").strip()
-    bridge_user = bridge_user_tf or config.bridge_ssh_user(cfg)
+    bridge_user = (bridge_user_override or "").strip() or bridge_user_tf or config.bridge_ssh_user(cfg)
+    if bridge_ip_override:
+        typer.echo(f"[configure] bridge IP override: {bridge_ip} (user={bridge_user})")
 
     inv = adir / "inventory" / "hosts.ini"
     ansible_runner.write_inventory(
@@ -54,6 +85,29 @@ def configure() -> None:
         bridge_key=config.ssh_key_for_bridge(cfg),
     )
     typer.echo(f"[configure] inventory -> {inv}")
+
+    chain_mode = _bridge_chain_mode(tf_dir)
+    # Timeweb's :443 gets its Reality/TLS reset by RU DPI (SS on a high port survives),
+    # so the Timeweb bridge exposes VLESS+Reality on a non-443 port. Yandex stays on 443.
+    bridge_reality_port = 8443 if chain_mode == "ss" else 443
+
+    if bridge_only:
+        if not bridge_ip:
+            typer.secho("--bridge-only set but terraform output bridge_ip is empty.", fg=typer.colors.RED)
+            raise typer.Exit(1)
+        playbook = adir / "playbooks" / "site.yml"
+        typer.echo(
+            f"[configure] bridge-only: {playbook.name} --limit bridge (Exit NOT touched)"
+            f"  chain_mode={chain_mode}  vless_port={bridge_reality_port}"
+        )
+        ansible_runner.run_playbook(
+            adir,
+            playbook,
+            inv,
+            {"bridge_chain_mode": chain_mode, "bridge_reality_port": bridge_reality_port},
+            limit="bridge",
+        )
+        return
 
     # Load probed Reality target — mandatory, no silent fallback.
     try:
@@ -82,6 +136,8 @@ def configure() -> None:
         "ss_port": int(xray.get("ss_port", 8388)),
         "ss_method": str(xray.get("ss_method", "2022-blake3-aes-128-gcm")),
         "chain_port": int(xray.get("chain_port", 8443)),
+        "bridge_chain_mode": chain_mode,
+        "bridge_reality_port": bridge_reality_port,
     }
     if not extra["panel_pass"]:
         typer.secho("panel_pass missing: set PROXY_PIPELINE_PANEL_PASS or config/pipeline.yaml", fg=typer.colors.RED)
@@ -92,6 +148,22 @@ def configure() -> None:
     )
     typer.echo(f"[configure] playbook -> {playbook.name}")
     ansible_runner.run_playbook(adir, playbook, inv, extra)
+
+
+@app.command()
+def configure(
+    bridge_only: bool = typer.Option(
+        False, "--bridge-only", help="Only (re)configure the bridge via --limit; never touch the Exit"
+    ),
+    bridge_ip: str = typer.Option(
+        None, "--bridge-ip", help="Override bridge IP (use when a -target apply left outputs stale)"
+    ),
+    bridge_user: str = typer.Option(
+        None, "--bridge-user", help="Override bridge SSH user (Timeweb=root, Yandex=ubuntu)"
+    ),
+) -> None:
+    """Write Ansible inventory from Terraform outputs and run playbooks."""
+    _do_configure(bridge_only=bridge_only, bridge_ip_override=bridge_ip, bridge_user_override=bridge_user)
 
 
 @app.command("probe-targets")
@@ -321,43 +393,34 @@ def links_cmd(
 
 @app.command()
 def rotate(
-    target: str = typer.Argument(..., case_sensitive=False, help="exit | bridge | all"),
+    target: str = typer.Argument("all", case_sensitive=False, help="all | exit | bridge"),
+    region: str = typer.Option(None, "--region", help="Set exit_region in tfvars before rotating"),
+    plan: str = typer.Option(None, "--plan", help="Set exit_plan in tfvars before rotating"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="terraform apply -auto-approve (no prompt)"),
 ) -> None:
-    """Recreate Exit and/or Bridge VMs via Terraform, then re-run configure."""
-    cfg = _cfg()
-    tf_dir = paths.terraform_dir(cfg)
+    """Recreate Exit and/or Bridge and re-issue links, via scripts/rotate-chain.sh.
+
+    Thin wrapper over the script so the robust flow lives in one place: venv activation,
+    Yandex auth from config/key.json, refusing on stale Timeweb-in-state or a Gen-1 plan in
+    a Gen-2-only region, `terraform apply -replace`, wait for SSH, re-probe Reality,
+    configure, and links --qr. Default apply is interactive; pass --yes for unattended.
+    """
     t = target.lower().strip()
-    if t == "exit":
-        terraform.terraform_destroy_targets(
-            tf_dir, ["module.exit.cherryservers_server.exit"], auto_approve=True
-        )
-        terraform.terraform_apply(tf_dir)
-    elif t == "bridge":
-        outs = terraform.terraform_output_json(tf_dir)
-        if not (outs.get("bridge_instance_id") or "").strip():
-            typer.secho("Bridge not enabled in Terraform (enable_yandex_bridge=false).", fg=typer.colors.RED)
-            raise typer.Exit(1)
-        terraform.terraform_destroy_targets(
-            tf_dir, ["module.bridge[0].yandex_compute_instance.bridge"], auto_approve=True
-        )
-        terraform.terraform_apply(tf_dir)
-    elif t == "all":
-        terraform.terraform_destroy_targets(
-            tf_dir, ["module.exit.cherryservers_server.exit"], auto_approve=True
-        )
-        terraform.terraform_destroy_targets(
-            tf_dir,
-            ["module.bridge[0].yandex_compute_instance.bridge"],
-            auto_approve=True,
-            ignore_errors=True,
-        )
-        terraform.terraform_apply(tf_dir)
-    else:
-        typer.secho("target must be exit|bridge|all", fg=typer.colors.RED)
+    if t not in ("all", "exit", "bridge"):
+        typer.secho("target must be all|exit|bridge", fg=typer.colors.RED)
         raise typer.Exit(2)
-    typer.echo("[rotate] waiting for cloud-init / SSH …")
-    time.sleep(25)
-    configure()
+    script = paths.repo_root() / "scripts" / "rotate-chain.sh"
+    if not script.exists():
+        typer.secho(f"rotation script not found: {script}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    cmd = ["bash", str(script), t]
+    if region:
+        cmd += ["--region", region]
+    if plan:
+        cmd += ["--plan", plan]
+    if yes:
+        cmd += ["--yes"]
+    raise typer.Exit(subprocess.call(cmd, cwd=str(paths.repo_root())))
 
 
 def main() -> None:

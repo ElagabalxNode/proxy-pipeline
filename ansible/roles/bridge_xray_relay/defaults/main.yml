@@ -1,1 +1,10 @@
 pipeline_state_dir: "{{ playbook_dir }}/../../state"
+
+# How the bridge relays to the Exit:
+#   xhttp - VLESS/xhttp+Reality to Exit:CHAIN_PORT (default; used by the Yandex bridge).
+#   ss    - Shadowsocks-2022 to the Exit's existing :ss_port inbound (no vision, not xHTTP).
+# Timeweb's egress network breaks the xhttp/HTTP-2 tunnel to the Exit, and vision must not
+# be used on a relay hop — so the Timeweb bridge relays via SS-2022 (reuses the Exit's SS
+# inbound; no Exit change). pipelinectl picks the mode per active provider; default stays
+# xhttp so the existing Yandex bridge is unaffected.
+bridge_chain_mode: xhttp

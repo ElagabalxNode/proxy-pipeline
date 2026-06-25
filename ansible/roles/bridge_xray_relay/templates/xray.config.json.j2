@@ -14,7 +14,7 @@
     {
       "tag": "vless-reality-in",
       "listen": "0.0.0.0",
-      "port": 443,
+      "port": {{ bridge_reality_port | default(443) | int }},
       "protocol": "vless",
       "settings": {
         "clients": [
@@ -60,6 +60,22 @@
     }
   ],
   "outbounds": [
+{% if bridge_chain_mode == "ss" %}
+    {
+      "tag": "chain-to-exit",
+      "protocol": "shadowsocks",
+      "settings": {
+        "servers": [
+          {
+            "address": "{{ exit_ip }}",
+            "port": {{ ss_port | int }},
+            "method": "{{ ss_method }}",
+            "password": "{{ ss_password }}"
+          }
+        ]
+      }
+    },
+{% else %}
     {
       "tag": "chain-to-exit",
       "protocol": "vless",
@@ -95,6 +111,7 @@
         }
       }
     },
+{% endif %}
     {
       "tag": "direct",
       "protocol": "freedom",

@@ -21,6 +21,14 @@ providers:
     subnet_id: ""
     create_vpc: false
     instance_name: proxy-bridge
+  timeweb:
+    # RU bridge on Timeweb Cloud (cheaper than Yandex). Auth: export TWC_TOKEN
+    # (token must allow "delete services via API without a Telegram code").
+    # The actual toggle lives in terraform.tfvars (enable_timeweb_bridge etc.);
+    # this block documents the intended setup.
+    enabled: false
+    configurator_location: ru-1 # ru-1=СПб, ru-2=Москва, de-1, kz-1
+    availability_zone: "" # spb-1/msk-1/...; empty = Timeweb chooses
 
 ssh:
   exit_user: root
@@ -51,4 +59,3 @@ telegram:
   bot_token: "" # or env TELEGRAM_BOT_TOKEN
   allowed_user_ids: [] # Telegram user ids allowed to use /status, /validate, …
   notify_chat_id: "" # target for pipelinectl notify and future watchdog alerts
-`

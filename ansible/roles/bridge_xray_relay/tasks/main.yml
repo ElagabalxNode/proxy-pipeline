@@ -73,9 +73,9 @@
     enabled: true
     state: restarted
 
-- name: Wait for Xray on 443
+- name: Wait for Xray on the client VLESS port
   ansible.builtin.wait_for:
-    port: 443
+    port: "{{ bridge_reality_port | default(443) | int }}"
     timeout: 60
 
 - name: Write bridge runtime for clients (controller)

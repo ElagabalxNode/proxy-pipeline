@@ -1,0 +1,30 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+# Secrets (tokens, panel password) go through ENVIRONMENT VARIABLES, never this file:
+#   export TF_VAR_cherry_api_token="..."
+#   export TF_VAR_panel_pass="..."         # also: export PROXY_PIPELINE_PANEL_PASS="$TF_VAR_panel_pass"
+#   export TWC_TOKEN="..."                 # Timeweb bridge (token: allow "delete via API without Telegram")
+#   export YC_TOKEN="..."                  # only if you use the Yandex bridge
+
+# --- Exit (Cherry Servers) ---
+cherry_project_id = 0 # number from the Cherry panel URL
+exit_region       = "NL-Amsterdam"
+exit_plan         = "B1-1-1gb-20s-shared"
+exit_image        = "ubuntu_24_04_64bit"
+
+ssh_public_key_path = "~/.ssh/proxy_pipeline.pub"
+
+# --- Bridge: Timeweb Cloud (RU, cheap) ---
+enable_timeweb_bridge         = true
+timeweb_configurator_location = "ru-2"  # ru-1=СПб, ru-2=Москва, de-1, kz-1
+timeweb_availability_zone     = "msk-1" # spb-1/msk-1/...; set "" if the account can't pick a zone
+timeweb_cpu                   = 1
+timeweb_ram_mb                = 1024  # MB, divisible by 1024
+timeweb_disk_mb               = 15360 # MB (15 GB)
+
+# --- Bridge: Yandex Cloud (legacy / fallback) ---
+# Zero-downtime cutover: keep this `true` until the Timeweb bridge is validated and
+# clients have new links, then set `false` and re-apply to stop Yandex billing.
+enable_yandex_bridge = false
+yandex_folder_id     = ""
+yandex_subnet_id     = ""
+yandex_zone          = "ru-central1-a"
