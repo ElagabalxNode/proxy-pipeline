@@ -156,8 +156,19 @@ pipelinectl rotate all --yes            # без интерактивного п
 scripts/rotate-chain.sh all
 ```
 
-По умолчанию `terraform apply` спрашивает подтверждение один раз. В конце печатается новый QR —
-клиенту отдавать `.client-links-qr/bridge_vless.png`. Подробности и ручные фазы:
+По умолчанию `terraform apply` спрашивает подтверждение один раз. В конце печатается QR —
+клиенту отдавать `.client-links-qr/bridge_vless.png`.
+
+**Клиентский QR не меняется ни при какой ротации, кроме явного `--new-ip`.** У моста
+зарезервированный (статический) публичный IP — `yandex_vpc_address`, переживает пересоздание VM, —
+а его identity (uuid, ключ Reality, shortId, SNI, пароль SS) роль моста переиспользует: читает с
+живого моста (`/usr/local/etc/xray/config.json`), а для пересозданной VM — из копии
+`state/bridge_identity.json`. `rotate exit` лишь перенацеливает outbound моста на новый Exit;
+`rotate bridge|all` пересоздаёт VM моста за тем же IP с той же identity. Скрипт сверяет
+bridge-ссылки до/после и печатает `UNCHANGED`. Новый QR — только по `rotate bridge --new-ip`
+(новый адрес + новая identity). Резерв адреса ничего не стоит, пока он привязан к работающей VM
+(0.26 ₽/ч, как и динамический); за *неиспользуемый* зарезервированный адрес YC берёт ещё ~0.34 ₽/ч.
+Подробности и ручные фазы:
 [`docs/RUNBOOK-ROTATE-CHAIN.md`](docs/RUNBOOK-ROTATE-CHAIN.md).
 
 ## Быстрый старт

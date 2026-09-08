@@ -38,3 +38,8 @@ output "bridge_ssh_user" {
 output "pipeline_contract_version" {
   value = 1
 }
+
+output "bridge_address_id" {
+  description = "Reserved (static) public address of the YC bridge — survives VM rebuilds"
+  value       = try(module.bridge[0].address_id, "")
+}

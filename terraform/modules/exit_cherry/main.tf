@@ -101,6 +101,10 @@ resource "cherryservers_server" "exit" {
 
   lifecycle {
     ignore_changes = [hostname]
+    # Create the replacement first, destroy the old Exit only once it exists: an out-of-stock
+    # region (Cherry API 400 "Server is out of stock", 2026-09-08) must not leave the chain
+    # without an Exit.
+    create_before_destroy = true
   }
 }
 

@@ -31,9 +31,9 @@
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "{{ reality_sni }}:443",
+          "dest": "{{ bridge_reality_sni }}:443",
           "xver": 0,
-          "serverNames": ["{{ reality_sni }}"],
+          "serverNames": ["{{ bridge_reality_sni }}"],
           "privateKey": "{{ bridge_private_key }}",
           "shortIds": ["{{ bridge_short_id }}"]
         }
@@ -49,8 +49,8 @@
       "port": {{ ss_port | int }},
       "protocol": "shadowsocks",
       "settings": {
-        "method": "{{ ss_method }}",
-        "password": "{{ ss_password }}",
+        "method": "{{ bridge_ss_method }}",
+        "password": "{{ bridge_ss_password }}",
         "network": "tcp,udp"
       },
       "sniffing": {
@@ -100,7 +100,7 @@
         "realitySettings": {
           "show": false,
           "fingerprint": "chrome",
-          "serverName": "{{ reality_sni }}",
+          "serverName": "{{ exit_reality_sni }}",
           "publicKey": "{{ exit_public_key }}",
           "shortId": "{{ exit_short_id }}",
           "spiderX": ""

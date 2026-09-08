@@ -13,3 +13,7 @@ output "instance_id" {
 output "ssh_user" {
   value = "ubuntu"
 }
+
+output "address_id" {
+  value = yandex_vpc_address.bridge.id
+}

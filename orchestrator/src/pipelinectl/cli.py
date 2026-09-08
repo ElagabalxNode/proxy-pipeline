@@ -397,8 +397,14 @@ def rotate(
     region: str = typer.Option(None, "--region", help="Set exit_region in tfvars before rotating"),
     plan: str = typer.Option(None, "--plan", help="Set exit_plan in tfvars before rotating"),
     yes: bool = typer.Option(False, "--yes", "-y", help="terraform apply -auto-approve (no prompt)"),
+    new_ip: bool = typer.Option(
+        False, "--new-ip", help="bridge|all: replace the reserved bridge IP + identity (QR changes)"
+    ),
 ) -> None:
     """Recreate Exit and/or Bridge and re-issue links, via scripts/rotate-chain.sh.
+
+    The bridge keeps its reserved IP and identity, so the client QR survives every rotation
+    unless --new-ip explicitly asks for a new address.
 
     Thin wrapper over the script so the robust flow lives in one place: venv activation,
     Yandex auth from config/key.json, refusing on stale Timeweb-in-state or a Gen-1 plan in
@@ -420,6 +426,8 @@ def rotate(
         cmd += ["--plan", plan]
     if yes:
         cmd += ["--yes"]
+    if new_ip:
+        cmd += ["--new-ip"]
     raise typer.Exit(subprocess.call(cmd, cwd=str(paths.repo_root())))
 
 

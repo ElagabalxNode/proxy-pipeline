@@ -4,5 +4,9 @@
   "bridge_uuid": "{{ bridge_client_uuid }}",
   "bridge_public_key": "{{ bridge_public_key }}",
   "bridge_short_id": "{{ bridge_short_id }}",
-  "bridge_reality_port": {{ bridge_reality_port | default(443) | int }}
+  "bridge_reality_port": {{ bridge_reality_port | default(443) | int }},
+  "bridge_reality_sni": "{{ bridge_reality_sni }}",
+  "bridge_ss_method": "{{ bridge_ss_method }}",
+  "bridge_ss_password": "{{ bridge_ss_password }}",
+  "bridge_ss_port": {{ exit_state.ss_port | int }}
 }
