@@ -138,6 +138,62 @@ pipelinectl links --format json
 pipelinectl links --no-export
 ```
 
+### 4b. Chain probe — где именно встала цепочка
+
+Роль моста ставит на мост systemd-timer `chain-probe` (раз в минуту, три замера в JSONL
+`/var/log/chain-probe/probe.jsonl`): `tls_exit` — TLS-рукопожатие мост→Exit (хоп через границу),
+`chain_http` — HTTP сквозь всю цепочку через loopback-SOCKS `127.0.0.1:1080`, `direct_http` — тот же
+запрос с моста напрямую, минуя Exit (`127.0.0.1:1081`, контроль). Контроллер зеркалит лог в
+`state/probe/` (timer `proxy-pipeline-probe-pull`, раз в 5 мин). Когда клиенты жалуются:
+
+```bash
+pipelinectl chainlog                    # сводка за 24h: fail%, p50/p95 и окна сбоев с вердиктом
+pipelinectl chainlog --since 7d --pull  # забрать лог с моста сейчас и посмотреть неделю
+```
+
+Четвёртый замер — `dest_tls`: TLS до **собственного Reality-dest моста**. xray дозванивает dest на
+каждое клиентское рукопожатие через системный резолвер, и если CDN-edge оттуда недоступен, клиенты
+видят `-1`/минутные коннекты при полностью здоровой цепочке (11.09.2026: `www.nvidia.com` из YC).
+Поэтому системный резолвер моста, `dns` xray и зонд используют один список `bridge_dns_servers`
+(по умолчанию Яндекс-DNS — RU-steering CDN даёт edge'ы, достижимые из YC).
+
+Вердикт по окну: упали `chain_http`+`direct_http` → egress моста / граница (клиенты лежат);
+`chain_http`+`tls_exit` → хоп мост→Exit (DPI или Exit мёртв); только `chain_http` → сторона Exit;
+только `dest_tls` → Reality-dest недоступен с моста (сменить `--bridge-dest`/`--bridge-sni`).
+
+`pipelinectl validate --deep` теперь прогоняет один раунд зонда **на мосту** и печатает его как
+`bridge_tls_exit`/`bridge_chain_http`/`bridge_direct_http`/`bridge_dest_tls`; `rotate` заканчивается
+этим же чеком и завершается с ошибкой, если цепочка настроена, но трафик не идёт.
+
+**Файрвол Exit'а (роль `exit_firewall`, идемпотентна, применяется в конце `configure`/`rotate`
+или отдельно: `pipelinectl configure --exit-firewall-only`).** Снаружи Exit пуст: 443/8388/8443 —
+только с моста и контроллера, 22/2053 — только с контроллера (панель 3X-UI наружу закрыта; свой IP
+для SSH — `exit_fw_extra_admin_cidrs`, SSH на весь мир — `exit_fw_ssh_world: true`). Защита от
+самоблокировки: перед включением ставится таймер `ufw disable` через 5 минут, который снимается
+только после успешной **новой** SSH-сессии с контроллера. Прямые (`Direct-*`) ссылки после этого
+работают только с моста/контроллера — клиенты всегда идут через мост.
+
+**Алерты (`pipelinectl alert-check`, таймер `proxy-pipeline-alert` на контроллере раз в 5 мин).**
+По зеркалу лога зонда: 3 подряд раунда с упавшим хопом/цепочкой → `DOWN` (с вердиктом и с какого
+времени), нет раундов 15 мин → `NO DATA`, потом `RECOVERED`; каждое событие один раз, напоминание
+о `DOWN` раз в 6 ч. Каналы, которые доходят до телефона в РФ **без VPN**: e-mail (SMTP с app-паролем,
+`alerts.email_to/smtp_*`) и SMS через sms.ru (`alerts.sms_ru_api_id/sms_to`); Telegram — если задан,
+но он при лежащей цепочке из РФ недоступен. Секреты — `PROXY_PIPELINE_SMTP_PASS`,
+`PROXY_PIPELINE_SMSRU_API_ID`. Проверка без отправки: `pipelinectl alert-check --dry-run`.
+
+**Вотчдог (`pipelinectl watchdog`, тот же таймер `proxy-pipeline-alert`).** При `DOWN` по вине exit'а
+(вердикты «хоп» / «сторона Exit») сам чинит: подтверждает сбой **живым** раундом зонда на мосту
+(зеркало может отставать на 5 мин), затем `rotate exit --yes` в том же регионе — со всеми гейтами
+и перекатами, — затем по очереди `watchdog.fallback_regions`; алерт уходит **только если все попытки
+провалились** (или ротация не поможет: умер egress моста / мост недоступен). Ограничители:
+`cooldown_hours` (2), `max_per_day` (3), никогда параллельно с ручной ротацией
+(`state/.rotate.lock`). Об успешной авто-ротации приходит короткое письмо (`notify_on_success`).
+Логи попыток — `state/watchdog/rotate-YYYYMMDD.log`. Без ротации: `pipelinectl alert-check`;
+сухой прогон: `pipelinectl watchdog --dry-run`.
+
+Reality-SNI/dest моста: `pipelinectl configure --bridge-only --bridge-dest 80.239.254.22:443`
+(только dest, QR не меняется) или `--bridge-sni download.docker.com` (меняется `sni=` → новый QR).
+
 ### 5. Rotate
 
 `pipelinectl rotate` пересоздаёт ноды и сразу перевыпускает ссылки/QR — тонкая обёртка над
@@ -151,6 +207,16 @@ pipelinectl rotate exit                 # только Exit
 pipelinectl rotate bridge               # только мост
 pipelinectl rotate all --region SE-Stockholm --plan B2-1-1gb-20s-shared   # со сменой региона
 pipelinectl rotate all --yes            # без интерактивного подтверждения terraform
+
+# Сменить локацию Exit: сначала посмотреть живое наличие по регионам (Cherry API)…
+pipelinectl stock                       # сток текущего exit_plan по регионам + подсказка команды
+pipelinectl stock --all                 # все cloud-VPS планы (B1-* только LT/NL/US/SG, B2-* везде)
+# Репутация IP (InternetDB, без ключа): чужие порты/теги malware/чужие hostnames = «грязный» адрес
+pipelinectl ipcheck 84.32.104.161        # DIRTY — previous tenant's services on ports [111, 137, …]
+# …затем ротировать в выбранный регион (скрипт сам перепроверит сток, достижимость с моста
+# и репутацию нового IP, перекатывая exit до 4 раз):
+pipelinectl rotate exit --region NL-Amsterdam
+pipelinectl rotate exit --region LT-Siauliai --plan B1-1-1gb-20s-shared
 
 # Эквивалентно напрямую:
 scripts/rotate-chain.sh all

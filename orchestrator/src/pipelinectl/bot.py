@@ -180,6 +180,7 @@ def main() -> None:
                 "pipelinectl",
                 "rotate",
                 target,
+                "--yes",  # nobody can answer the plan confirmation from a bot
                 cwd=str(root),
                 env=env,
                 stdout=asyncio.subprocess.PIPE,

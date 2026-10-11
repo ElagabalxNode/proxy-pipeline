@@ -9,7 +9,9 @@
 # anything outside the target (unrelated drift once recreated the bridge), and an Exit that
 # an earlier failed rotation left missing from tfstate is simply created. The bridge sits on a
 # reserved IP and its identity is restored from state/bridge_identity.json, so the client QR
-# survives every rotation except an explicit `bridge --new-ip`.
+# survives every rotation except an explicit `bridge --new-ip`. A new Exit must answer TCP from
+# the bridge (RU-side IP blocks pass ICMP but drop TCP); if not, the Exit is re-rolled for another
+# IP up to ROTATE_MAX_REROLLS (4) times and each blocked IP is logged to state/blocked_exit_ips.log.
 #
 # Usage:
 #   scripts/rotate-chain.sh [all|exit|bridge] [--region SLUG] [--plan SLUG] [--new-ip] [--yes]
@@ -52,6 +54,10 @@ warn() { printf '\033[1;33m[rotate] %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31m[rotate] ERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 tf() { terraform -chdir="$TFDIR" "$@"; }
 
+# ── 0. single instance: the watchdog may fire while an operator rotates by hand ────────
+exec 9>"$REPO/state/.rotate.lock"
+flock -n 9 || die "another rotation is already running (state/.rotate.lock is held)"
+
 # ── 1. environment: venv (system apt-ansible 2.10.8 is broken), secrets, YC auth ──
 [ -f "$REPO/.venv/bin/activate" ] || die ".venv missing — system apt-ansible 2.10.8 is incompatible; create the venv first"
 # shellcheck disable=SC1091
@@ -90,25 +96,11 @@ if tf state list 2>/dev/null | grep -q 'twc_'; then
 fi
 # Cherry stock: an out-of-stock region fails only at create time (2026-09-08: SE-Stockholm had 0,
 # the API answered 400 "Server is out of stock" after the old Exit was already gone). Ask first.
-if [ "$TARGET" != bridge ] && [ -n "${CHERRY_API_TOKEN:-}" ]; then
-  STOCK="$(CHERRY_API_TOKEN="$CHERRY_API_TOKEN" REGION="$REGION_NOW" PLAN="$PLAN_NOW" python3 - <<'PY' 2>/dev/null || echo "?"
-import json, os, urllib.request
-tok, region, plan = os.environ["CHERRY_API_TOKEN"], os.environ["REGION"], os.environ["PLAN"]
-def get(p):
-    r = urllib.request.Request("https://api.cherryservers.com/v1" + p, headers={"Authorization": "Bearer " + tok})
-    return json.load(urllib.request.urlopen(r, timeout=20))
-for t in get("/teams"):
-    for p in get(f"/teams/{t['id']}/plans"):
-        if (p.get("slug") or p.get("name")) != plan: continue
-        for ar in p.get("available_regions", []):
-            if (ar.get("slug") or ar.get("name")) == region:
-                print(ar.get("stock_qty", "?")); raise SystemExit
-print("?")
-PY
-)"
+if [ "$TARGET" != bridge ]; then
+  STOCK="$(pipelinectl stock --plan "$PLAN_NOW" --region "$REGION_NOW" --format qty 2>/dev/null || echo "?")"
   case "$STOCK" in
     "?") warn "could not check Cherry stock for $PLAN_NOW in $REGION_NOW — continuing blind" ;;
-    0)   die "Cherry has NO stock for $PLAN_NOW in $REGION_NOW — pick another region/plan (--region NL-Amsterdam | LT-Siauliai …)" ;;
+    0)   die "Cherry has NO stock for $PLAN_NOW in $REGION_NOW — run 'pipelinectl stock' and pick another --region/--plan" ;;
     *)   c "Cherry stock: $STOCK × $PLAN_NOW in $REGION_NOW" ;;
   esac
 fi
@@ -155,9 +147,13 @@ BRIDGE_LINKS_BEFORE="$(bridge_links)"
 c "terraform init"
 tf init -input=false >/dev/null
 PLANFILE="$TFDIR/.rotate.tfplan"
-c "terraform plan ${REPLACE[*]}"
-tf plan -input=false -out="$PLANFILE" "${REPLACE[@]}" >/dev/null
-UNEXPECTED="$(tf show -json "$PLANFILE" | python3 -c '
+trap 'rm -f "$PLANFILE"' EXIT   # never leave a plan (it embeds secrets) behind, however we exit
+
+plan_and_apply() { # confirm|auto — plans REPLACE[], runs the guard, (asks,) applies the saved plan
+  local mode="$1" unexpected ans
+  c "terraform plan ${REPLACE[*]}"
+  tf plan -input=false -out="$PLANFILE" "${REPLACE[@]}" >/dev/null
+  unexpected="$(tf show -json "$PLANFILE" | python3 -c '
 import json, sys
 allowed = set(sys.argv[1:])
 for rc in json.load(sys.stdin).get("resource_changes", []):
@@ -165,23 +161,28 @@ for rc in json.load(sys.stdin).get("resource_changes", []):
     if "delete" in acts and rc["address"] not in allowed:
         print("  " + rc["address"] + "  ->  " + "/".join(acts))
 ' "${REPLACE[@]#-replace=}")"
-if [ -n "$UNEXPECTED" ]; then
-  rm -f "$PLANFILE"
-  die "plan would destroy/replace resources OUTSIDE the rotation target '$TARGET':
-$UNEXPECTED
+  if [ -n "$unexpected" ]; then
+    rm -f "$PLANFILE"
+    die "plan would destroy/replace resources OUTSIDE the rotation target '$TARGET':
+$unexpected
 Fix the drift first (lifecycle ignore_changes, or rotate 'all' deliberately)."
-fi
-tf show -no-color "$PLANFILE" | grep -E "^Plan:|will be (created|destroyed|replaced|updated)|must be replaced" || true
-if [ "$ASSUME_YES" != 1 ]; then
-  read -r -p "[rotate] apply this plan? [y/N] " ans
-  [[ "$ans" =~ ^[Yy]$ ]] || { rm -f "$PLANFILE"; die "aborted by user"; }
-fi
-c "terraform apply (saved plan)"
-tf apply -input=false "$PLANFILE"
-rm -f "$PLANFILE"
+  fi
+  tf show -no-color "$PLANFILE" | grep -E "^Plan:|will be (created|destroyed|replaced|updated)|must be replaced" || true
+  if [ "$mode" = confirm ] && [ "$ASSUME_YES" != 1 ]; then
+    # `|| ans=""`: at EOF (no tty, e.g. a bot without --yes) read returns 1 and set -e would kill
+    # the script silently — treat it as "no" and say so.
+    read -r -p "[rotate] apply this plan? [y/N] " ans || ans=""
+    [[ "$ans" =~ ^[Yy]$ ]] || die "aborted (no confirmation; pass --yes for unattended runs)"
+  fi
+  c "terraform apply (saved plan)"
+  tf apply -input=false "$PLANFILE"
+  rm -f "$PLANFILE"
+}
+plan_and_apply confirm
 
 EXIT_IP="$(tf output -raw exit_ip 2>/dev/null || true)"
 BRIDGE_IP="$(tf output -raw bridge_ip 2>/dev/null || true)"
+BRIDGE_USER="$(tf output -raw bridge_ssh_user 2>/dev/null || true)"; BRIDGE_USER="${BRIDGE_USER:-ubuntu}"
 c "new Exit=$EXIT_IP  new Bridge=$BRIDGE_IP"
 if [ "$NEW_IP" = 1 ]; then
   rm -f "$REPO/state/bridge_identity.json"
@@ -190,7 +191,7 @@ fi
 # A rebuilt VM behind the same (reserved) IP has a new host key — drop stale known_hosts entries.
 for h in "$EXIT_IP" "$BRIDGE_IP"; do [ -n "$h" ] && ssh-keygen -R "$h" >/dev/null 2>&1 || true; done
 
-# ── 6. wait for the recreated node to be reachable ───────────────────────────────
+# ── 6. wait for the recreated node(s); the Exit must also answer TCP FROM THE BRIDGE ──────
 wait_ssh() { # host user [need_marker]
   local host="$1" user="$2" marker="${3:-}" i
   for i in $(seq 1 60); do
@@ -203,13 +204,60 @@ wait_ssh() { # host user [need_marker]
   done
   return 1
 }
+# 2026-09-11: a fresh Cherry DE IP (84.32.98.23) answered TCP from this host but not one SYN from
+# the YC bridge reached it (ICMP did) — RU-side block of a recycled VPN range. Configuring the
+# bridge onto such an Exit takes the chain down for every client, so test TCP from the bridge
+# (port 22 is up first) and re-roll the Exit until one is reachable. ICMP would not catch it.
+bridge_can_reach_exit() {
+  ssh -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$BRIDGE_USER@$BRIDGE_IP" \
+    "for i in 1 2 3; do timeout 5 bash -c 'cat </dev/null >/dev/tcp/$EXIT_IP/22' 2>/dev/null && exit 0; sleep 3; done; exit 1"
+}
+MAX_REROLLS="${ROTATE_MAX_REROLLS:-4}"
 if [ "$TARGET" = bridge ]; then
   c "waiting for new bridge SSH ($BRIDGE_IP) …"
-  wait_ssh "$BRIDGE_IP" ubuntu || warn "bridge SSH not confirmed in ~10m (Ansible will still wait)"
+  wait_ssh "$BRIDGE_IP" "$BRIDGE_USER" || warn "bridge SSH not confirmed in ~10m (Ansible will still wait)"
 else
-  [ -n "$EXIT_IP" ] || die "terraform output exit_ip empty after apply"
-  c "waiting for new Exit SSH + cloud-init ($EXIT_IP) …"
-  wait_ssh "$EXIT_IP" root marker || die "Exit $EXIT_IP not ready (SSH/cloud-init) after ~10m"
+  if [ "$TARGET" = all ] && [ -n "$BRIDGE_IP" ]; then
+    c "waiting for new bridge SSH ($BRIDGE_IP) …"
+    wait_ssh "$BRIDGE_IP" "$BRIDGE_USER" || warn "bridge SSH not confirmed in ~10m"
+  fi
+  attempt=1
+  while :; do
+    [ -n "$EXIT_IP" ] || die "terraform output exit_ip empty after apply"
+    c "waiting for new Exit SSH ($EXIT_IP) …"
+    wait_ssh "$EXIT_IP" root || die "Exit $EXIT_IP: no SSH after ~10m"
+    if [ -z "$BRIDGE_IP" ]; then warn "no bridge — skipping bridge→Exit reachability check"; break; fi
+    c "checking TCP reachability of the new Exit FROM the bridge ($BRIDGE_IP → $EXIT_IP:22) …"
+    if bridge_can_reach_exit; then
+      c "bridge → Exit TCP OK"
+      # Recycled address? 2026-09-12: a fresh Exit inherited an IP whose previous tenant ran a
+      # malware C2 — the provider null-routed it within a day. InternetDB still shows that tenant.
+      rc=0; REP="$(pipelinectl ipcheck "$EXIT_IP" 2>&1)" || rc=$?
+      case "$rc" in
+        0) c "IP reputation: $REP"; break ;;
+        1) reason="dirty recycled IP — $REP" ;;
+        *) warn "IP reputation check unavailable ($REP) — continuing without it"; break ;;
+      esac
+    else
+      reason="not reachable over TCP from the bridge while this host reaches it (RU-side block)"
+    fi
+    echo "$(date -u +%FT%TZ) $EXIT_IP region=$REGION_NOW attempt=$attempt $reason" >> "$REPO/state/blocked_exit_ips.log"
+    warn "Exit $EXIT_IP rejected: $reason (logged to state/blocked_exit_ips.log)"
+    if [ "$attempt" -ge "$MAX_REROLLS" ]; then
+      die "$attempt Exits in a row rejected (RU-blocked or dirty) — this region's pool looks burned; try another --region (see 'pipelinectl stock') or another provider"
+    fi
+    attempt=$((attempt + 1))
+    c "re-rolling the Exit for a different IP (attempt $attempt/$MAX_REROLLS) …"
+    EXIT_ADDR="$(tf state list 2>/dev/null | grep -E 'cherryservers_server\.exit$' | head -1 || true)"
+    [ -n "$EXIT_ADDR" ] || die "Exit vanished from tfstate during re-roll"
+    REPLACE=(-replace="$EXIT_ADDR")
+    plan_and_apply auto   # same shape as the plan already confirmed: replace the Exit only
+    ssh-keygen -R "$EXIT_IP" >/dev/null 2>&1 || true
+    EXIT_IP="$(tf output -raw exit_ip 2>/dev/null || true)"
+    c "new Exit=$EXIT_IP"
+  done
+  c "waiting for Exit cloud-init to finish ($EXIT_IP) …"
+  wait_ssh "$EXIT_IP" root marker || die "Exit $EXIT_IP not ready (cloud-init marker) after ~10m"
 fi
 
 # ── 7. re-probe Reality target (exit/all only); keep a backup of the last good one ─
@@ -244,13 +292,20 @@ else
   QR_NOTE="CHANGED (unexpected) → re-issue bridge_vless.png"
 fi
 
+# ── 9b. end-to-end verification from the bridge's vantage — the leg clients actually use ──
+# `validate --deep` now runs one chain-probe round ON the bridge (hop, whole chain, bridge egress,
+# Reality dest). A rotation that "completed" but does not carry traffic must not end green.
+c "validate --deep (incl. one chain-probe round on the bridge)"
+FINAL_OK=1
+pipelinectl validate --deep || { FINAL_OK=0; warn "END-TO-END CHECK FAILED — the chain is configured but something does not work (see [FAIL] above)"; }
+
 # ── 10. summary ──────────────────────────────────────────────────────────────────
 PANEL="$(tf output -raw panel_url 2>/dev/null || true)"
-printf '\n\033[1;32m[rotate] DONE\033[0m\n'
+if [ "$FINAL_OK" = 1 ]; then printf '\n\033[1;32m[rotate] DONE\033[0m\n'; else printf '\n\033[1;31m[rotate] DONE — WITH FAILURES (see above)\033[0m\n'; fi
 echo   "  Exit:    ${EXIT_IP:-?}"
 echo   "  Bridge:  ${BRIDGE_IP:-?}"
 [ -n "$PANEL" ] && echo "  Panel:   $PANEL"
 echo   "  Links:   $REPO/.client-links"
 echo   "  QR:      $REPO/.client-links-qr/  ($QR_NOTE)"
 echo
-c "tip: verify the chain with 'pipelinectl validate --deep'"
+[ "$FINAL_OK" = 1 ] || exit 1

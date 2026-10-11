@@ -44,7 +44,7 @@ Timeweb-бридж **выведен из эксплуатации** (серве�
 > - **Out-of-stock после destroy.** Cherry по умолчанию destroy → create; в Stockholm было 0 в
 >   наличии → старый Exit уже уничтожен, новый не создан (`400 Server is out of stock`), exit
 >   пропал из tfstate. Закрыто: `create_before_destroy = true` на Exit, проверка стока через
->   Cherry API до apply, и `rotate exit` умеет **создать** Exit, если его в стейте нет.
+>   Cherry API до apply (`pipelinectl stock` показывает наличие по регионам заранее), и `rotate exit` умеет **создать** Exit, если его в стейте нет.
 >
 > Урок: у моста был **эфемерный** публичный IP, и любое пересоздание моста = новый QR у всех клиентов.
 > Закрыто 2026-09-08: адрес `130.193.37.161` сделан статическим на месте (`yc vpc address update

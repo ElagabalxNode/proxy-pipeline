@@ -38,6 +38,22 @@ def _login_base_url(data: dict[str, Any]) -> str:
     return f"http://{exit_ip}:{port}{prefix}".rstrip("/")
 
 
+def _panel_csrf_token(base: str, opener: urllib.request.OpenerDirector) -> str | None:
+    """3X-UI >= 3.4 rejects any POST without an X-CSRF-Token header (HTTP 403, empty body).
+
+    The token is bound to the session cookie, so it is fetched through the same opener right
+    before the request that needs it. Older panels have no /csrf-token: return None and go on.
+    """
+    req = urllib.request.Request(f"{base}/csrf-token", method="GET")
+    try:
+        with opener.open(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):  # HTTPError is an OSError
+        return None
+    tok = payload.get("obj") if isinstance(payload, dict) else None
+    return str(tok) if tok else None
+
+
 def _panel_login(
     data: dict[str, Any],
     panel_pass: str,
@@ -47,18 +63,22 @@ def _panel_login(
     login_url = f"{base}/login"
     user = str(data.get("panel_user") or "admin")
     body = urllib.parse.urlencode({"username": user, "password": panel_pass}).encode()
-    req = urllib.request.Request(
-        login_url,
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    csrf = _panel_csrf_token(base, opener)
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if csrf:
+        headers["X-CSRF-Token"] = csrf
+    req = urllib.request.Request(login_url, data=body, method="POST", headers=headers)
     try:
         with opener.open(req, timeout=20) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        return False, f"HTTP {e.code} on {login_url}: {(e.read() or b'').decode()[:300]}", opener
+        hint = "" if csrf else f" (no CSRF token from {base}/csrf-token)"
+        return (
+            False,
+            f"HTTP {e.code} on {login_url}{hint}: {(e.read() or b'').decode()[:300]}",
+            opener,
+        )
     except OSError as e:
         return False, f"{login_url}: {e}", opener
 
@@ -78,7 +98,10 @@ def _panel_inbounds_list(
 ) -> tuple[bool, str]:
     base = _login_base_url(data)
     list_url = f"{base}/panel/api/inbounds/list"
-    req = urllib.request.Request(list_url, method="GET")
+    csrf = _panel_csrf_token(base, opener)
+    req = urllib.request.Request(
+        list_url, method="GET", headers={"X-CSRF-Token": csrf} if csrf else {}
+    )
     try:
         with opener.open(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
@@ -167,11 +190,68 @@ def _tls_reality_probe(host: str, port: int, server_hostname: str) -> tuple[bool
     return True, f"handshake_ok sni={server_hostname} cn={cn or '?'}"
 
 
+BRIDGE_PROBE_SCRIPT = "/usr/local/bin/chain-probe.sh"
+BRIDGE_PROBE_LOG = "/var/log/chain-probe/probe.jsonl"
+
+
+def _bridge_probe_round(
+    bridge_ip: str,
+    bridge_user: str,
+    bridge_key: Path,
+    runner: Any = subprocess.run,
+) -> tuple[bool, str, list[dict[str, Any]]]:
+    """Run ONE chain-probe round on the bridge and return its records.
+
+    This is the vantage clients depend on: bridge→Exit hop, the whole chain, the bridge's own
+    egress and its Reality dest. Checks from the controller cannot see any of that.
+    """
+    remote = (
+        f"test -x {BRIDGE_PROBE_SCRIPT} || {{ echo NO_PROBE; exit 3; }}; "
+        f"sudo {BRIDGE_PROBE_SCRIPT} && sudo tail -n 8 {BRIDGE_PROBE_LOG}"
+    )
+    cmd = [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-i",
+        str(bridge_key),
+        f"{bridge_user}@{bridge_ip}",
+        remote,
+    ]
+    try:
+        p = runner(cmd, capture_output=True, text=True, timeout=150)
+    except Exception as e:  # noqa: BLE001
+        return False, str(e), []
+    out = p.stdout or ""
+    if "NO_PROBE" in out:
+        return False, "chain-probe not installed on the bridge (run pipelinectl configure)", []
+    if p.returncode != 0:
+        return False, (p.stderr or out or "ssh failed").strip()[:300], []
+    recs: list[dict[str, Any]] = []
+    for line in out.splitlines():
+        if line.startswith("{"):
+            try:
+                recs.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if not recs:
+        return False, "no probe output", []
+    last_ts = recs[-1].get("ts")
+    return True, "", [r for r in recs if r.get("ts") == last_ts]
+
+
 def run_deep_health(
     data: dict[str, Any],
     exit_key: Path,
     panel_pass: str,
     exit_user: str,
+    bridge_ip: str = "",
+    bridge_user: str = "ubuntu",
+    bridge_key: Path | None = None,
 ) -> HealthReport:
     rpt = HealthReport()
     exit_ip = str(data.get("exit_ip") or "")
@@ -180,7 +260,14 @@ def run_deep_health(
         return rpt
 
     if not panel_pass:
-        rpt.add(CheckResult("deep_prereq", False, "error", "panel_pass missing (env PROXY_PIPELINE_PANEL_PASS or config)"))
+        rpt.add(
+            CheckResult(
+                "deep_prereq",
+                False,
+                "error",
+                "panel_pass missing (env PROXY_PIPELINE_PANEL_PASS or config)",
+            )
+        )
         return rpt
 
     jar = CookieJar()
@@ -203,5 +290,22 @@ def run_deep_health(
         rpt.add(CheckResult("tls_reality", ok_tls, "error" if not ok_tls else "info", msg_tls))
     else:
         rpt.add(CheckResult("tls_reality", False, "warn", "reality_sni missing in runtime"))
+
+    if bridge_ip and bridge_key:
+        ok_p, msg_p, recs = _bridge_probe_round(bridge_ip, bridge_user, bridge_key)
+        if not ok_p:
+            rpt.add(CheckResult("bridge_probe", False, "warn", msg_p))
+        for r in recs:
+            good = r.get("ok") is True
+            detail = f"{r.get('ms')}ms"
+            if r.get("code"):
+                detail += f" http={r.get('code')}"
+            if r.get("err"):
+                detail += f" {r.get('err')}"
+            rpt.add(
+                CheckResult(
+                    f"bridge_{r.get('check')}", good, "error" if not good else "info", detail
+                )
+            )
 
     return rpt

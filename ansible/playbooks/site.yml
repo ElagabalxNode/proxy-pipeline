@@ -9,6 +9,7 @@
     pipeline_state_dir: "{{ playbook_dir }}/../../state"
   roles:
     - role: exit_xui_reality
+    - role: exit_firewall
 
 - name: Configure Bridge node
   hosts: bridge

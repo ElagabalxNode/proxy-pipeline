@@ -53,6 +53,27 @@ xray:
 alerts:
   telegram_bot_token: ""
   telegram_chat_id: ""
+  # Channels that reach a phone in Russia WITHOUT the VPN (the chain being down is the point).
+  # E-mail: any SMTP with an app password (smtp.yandex.ru:465 / smtp.gmail.com:465 / :587 STARTTLS).
+  email_to: ""
+  email_from: ""
+  smtp_host: smtp.yandex.ru
+  smtp_port: 465
+  smtp_user: ""
+  smtp_pass: ""            # or env PROXY_PIPELINE_SMTP_PASS
+  # SMS via sms.ru (optional): api_id from https://sms.ru/?panel=api
+  sms_ru_api_id: ""        # or env PROXY_PIPELINE_SMSRU_API_ID
+  sms_to: ""               # +7XXXXXXXXXX
+
+# Self-healing watchdog (pipelinectl watchdog, timer proxy-pipeline-alert every 5 min):
+# chain DOWN because of the Exit -> `rotate exit --yes` in the same region (all gates + re-rolls),
+# then each fallback region; alert only if every attempt failed. Rails against loops:
+watchdog:
+  auto_rotate: true
+  cooldown_hours: 2        # min time between automatic rotations
+  max_per_day: 3           # hard cap per 24 h, then alert only
+  fallback_regions: []     # e.g. ["LT-Siauliai", "DE-Frankfurt"] tried after the same region
+  notify_on_success: true  # e-mail/SMS "auto-rotated, new Exit X" (QR unchanged)
 
 # Optional: Telegram control plane (install orchestrator with pip install -e ".[telegram]").
 telegram:

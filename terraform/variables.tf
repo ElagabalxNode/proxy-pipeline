@@ -17,7 +17,7 @@ variable "exit_region" {
 
   validation {
     condition = contains(
-      ["LT-Siauliai", "NL-Amsterdam", "US-Chicago", "SG-Singapore", "SE-Stockholm", "DE-Frankfurt"],
+      ["LT-Siauliai", "NL-Amsterdam", "US-Chicago", "SG-Singapore", "SE-Stockholm", "DE-Frankfurt", "JP-Tokyo"],
       var.exit_region
     )
     error_message = "Unknown exit_region slug. Use Cherry GET /v1/regions."

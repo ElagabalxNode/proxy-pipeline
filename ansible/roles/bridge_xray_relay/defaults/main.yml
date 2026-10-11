@@ -8,3 +8,30 @@ pipeline_state_dir: "{{ playbook_dir }}/../../state"
 # inbound; no Exit change). pipelinectl picks the mode per active provider; default stays
 # xhttp so the existing Yandex bridge is unaffected.
 bridge_chain_mode: xhttp
+
+# ── Chain probe: continuous evidence of WHERE a stall happens (templates/chain-probe.sh.j2) ──
+# Runs on the bridge every chain_probe_interval; the controller mirrors the log directory into
+# chain_probe_pull_dir every chain_probe_pull_interval; read it with `pipelinectl chainlog`.
+chain_probe_enabled: true
+chain_probe_log: /var/log/chain-probe/probe.jsonl
+chain_probe_url: https://www.gstatic.com/generate_204
+chain_probe_socks_port: 1080      # loopback SOCKS -> whole chain
+chain_probe_direct_port: 1081     # loopback SOCKS -> bridge direct egress (reference)
+chain_probe_timeout: 15           # seconds per check; 3 checks fit well inside a minute
+chain_probe_interval: 60s
+chain_probe_keep_days: 14
+chain_probe_pull_interval: 5min
+chain_probe_pull_dir: "{{ pipeline_state_dir }}/probe"
+
+# DNS for the bridge's OWN lookups (client destinations pass through AsIs and resolve on the Exit).
+# What matters is the Reality dest, dialed on every client handshake — and xray dials it through
+# the OS resolver (Go net.Dialer), NOT through its own "dns" module. So this list is applied to
+# systemd-resolved (drop-in with Domains=~. so it wins over the cloud's DHCP servers) AND to
+# xray's dns block, and the probe's dest_tls resolves via the first plain-IP entry — all three see
+# the same CDN edges. 2026-09-11: the YC resolver / Cloudflare DoH returned an Akamai cluster that
+# blackholed from Yandex Cloud, so ~half of all client handshakes hung for 20 s; Yandex public DNS
+# steers to RU-side edges that all answer.
+bridge_dns_servers:
+  - "77.88.8.8"
+  - "77.88.8.1"
+  - "localhost"
