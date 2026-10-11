@@ -64,51 +64,32 @@
     msg: "3X-UI binary not found on Exit (/usr/local/x-ui/x-ui missing)"
   when: xui_bin_path.stdout is search("MISSING")
 
-- name: Reset 3X-UI bootstrap credentials
+# 3X-UI 3.x (React-SPA rewrite) moved/removed the /panel/setting/* HTTP API and now
+# requires a CSRF token on every POST. The `x-ui setting` CLI is stable across versions,
+# so panel port/path/admin-credentials are set via the CLI (no auth, no CSRF, deterministic
+# regardless of the random creds a fresh install generates), then we only use the HTTP API
+# (with CSRF) for what the CLI can't do: creating inbounds.
+- name: Configure panel (port, web base path, admin credentials) via x-ui CLI
   ansible.builtin.command:
     argv:
       - "{{ xui_bin_path.stdout | trim }}"
       - setting
       - -username
-      - admin
+      - "{{ panel_user }}"
       - -password
-      - admin
-  register: xui_bootstrap_user
+      - "{{ panel_pass }}"
+      - -port
+      - "{{ panel_port }}"
+      - -webBasePath
+      - "{{ panel_web_base_path }}"
+  register: xui_settings
   changed_when: true
   no_log: true
 
-- name: Reset 3X-UI bootstrap port
-  ansible.builtin.command:
-    argv:
-      - "{{ xui_bin_path.stdout | trim }}"
-      - setting
-      - -port
-      - "2053"
-  register: xui_bootstrap_port
-  changed_when: true
-
-- name: Reset 3X-UI bootstrap base path
-  ansible.builtin.command:
-    argv:
-      - "{{ xui_bin_path.stdout | trim }}"
-      - setting
-      - -webBasePath
-      - /
-  register: xui_bootstrap_path
-  changed_when: true
-
-- name: Restart x-ui after bootstrap reset
+- name: Restart x-ui to apply settings
   ansible.builtin.service:
     name: x-ui
     state: restarted
-
-- name: Wait for bootstrap panel port
-  ansible.builtin.wait_for:
-    host: "{{ ansible_host }}"
-    port: 2053
-    timeout: 120
-  delegate_to: localhost
-  run_once: true
 
 - name: Discover xray binary for x25519
   ansible.builtin.shell: |
@@ -194,112 +175,7 @@
   ansible.builtin.set_fact:
     cookie_jar: "{{ pipeline_state_dir }}/.3x-ui-cookies.txt"
 
-- name: Login to bootstrap 3X-UI session
-  ansible.builtin.shell: |
-    set -euo pipefail
-    rm -f "{{ cookie_jar }}"
-    curl -sS -c "{{ cookie_jar }}" -X POST \
-      -H "Content-Type: application/x-www-form-urlencoded" \
-      --data-urlencode "username=admin" \
-      --data-urlencode "password=admin" \
-      "http://{{ ansible_host }}:2053/login" \
-      | tee "{{ pipeline_state_dir }}/.login.json"
-    python3 - <<'PY'
-    import json
-    d=json.load(open("{{ pipeline_state_dir }}/.login.json"))
-    assert d.get("success") is True, d
-    PY
-  args:
-    executable: /bin/bash
-  delegate_to: localhost
-  run_once: true
-  no_log: true
-
-- name: Update panel port and web base path
-  ansible.builtin.shell: |
-    set -euo pipefail
-    curl -sS -b "{{ cookie_jar }}" -X POST \
-      "http://{{ ansible_host }}:2053/panel/setting/all" \
-      | tee "{{ pipeline_state_dir }}/.panel-settings-current.json"
-    python3 - <<'PY'
-    import json
-    import urllib.parse
-
-    current = json.load(open("{{ pipeline_state_dir }}/.panel-settings-current.json"))
-    assert current.get("success") is True, current
-
-    payload = current.get("obj") or {}
-    payload["webPort"] = int("{{ panel_port }}")
-    payload["webBasePath"] = "{{ panel_web_base_path }}"
-
-    def normalize(value):
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        if value is None:
-            return ""
-        return str(value)
-
-    encoded = urllib.parse.urlencode(
-        {key: normalize(value) for key, value in payload.items()},
-        doseq=False,
-    )
-    with open("{{ pipeline_state_dir }}/.panel-settings.form", "w", encoding="utf-8") as handle:
-        handle.write(encoded)
-    PY
-    curl -sS -b "{{ cookie_jar }}" -X POST \
-      -H "Content-Type: application/x-www-form-urlencoded" \
-      --data-binary @"{{ pipeline_state_dir }}/.panel-settings.form" \
-      "http://{{ ansible_host }}:2053/panel/setting/update" \
-      | tee "{{ pipeline_state_dir }}/.panel-settings.json"
-    python3 - <<'PY'
-    import json
-    d=json.load(open("{{ pipeline_state_dir }}/.panel-settings.json"))
-    assert d.get("success") is True, d
-    PY
-  args:
-    executable: /bin/bash
-  delegate_to: localhost
-  run_once: true
-
-- name: Update panel admin credentials
-  ansible.builtin.shell: |
-    set -euo pipefail
-    curl -sS -b "{{ cookie_jar }}" -X POST \
-      -H "Content-Type: application/x-www-form-urlencoded" \
-      --data-urlencode "oldUsername=admin" \
-      --data-urlencode "oldPassword=admin" \
-      --data-urlencode "newUsername={{ panel_user }}" \
-      --data-urlencode "newPassword={{ panel_pass }}" \
-      "http://{{ ansible_host }}:2053/panel/setting/updateUser" \
-      | tee "{{ pipeline_state_dir }}/.panel-user.json"
-    python3 - <<'PY'
-    import json
-    d=json.load(open("{{ pipeline_state_dir }}/.panel-user.json"))
-    assert d.get("success") is True, d
-    PY
-  args:
-    executable: /bin/bash
-  delegate_to: localhost
-  run_once: true
-  no_log: true
-
-- name: Restart panel after settings update
-  ansible.builtin.shell: |
-    set -euo pipefail
-    curl -sS -b "{{ cookie_jar }}" -X POST \
-      "http://{{ ansible_host }}:2053/panel/setting/restartPanel" \
-      | tee "{{ pipeline_state_dir }}/.panel-restart.json"
-    python3 - <<'PY'
-    import json
-    d=json.load(open("{{ pipeline_state_dir }}/.panel-restart.json"))
-    assert d.get("success") is True, d
-    PY
-  args:
-    executable: /bin/bash
-  delegate_to: localhost
-  run_once: true
-
-- name: Wait for final panel port
+- name: Wait for configured panel port
   ansible.builtin.wait_for:
     host: "{{ ansible_host }}"
     port: "{{ panel_port | int }}"
@@ -307,15 +183,23 @@
   delegate_to: localhost
   run_once: true
 
-- name: Login to configured 3X-UI session
+# 3X-UI 3.x serves a CSRF token at {base}/csrf-token (JSON: {"obj": "<token>", ...}) and
+# rejects any POST without the X-CSRF-Token header (HTTP 403). The token is bound to the
+# session cookie, so we keep one cookie jar across login + inbound creation, and fetch a
+# fresh token (with the current cookie) immediately before each POST.
+- name: Login to 3X-UI (CSRF-aware)
   ansible.builtin.shell: |
     set -euo pipefail
     rm -f "{{ cookie_jar }}"
-    curl -sS -c "{{ cookie_jar }}" -X POST \
+    BASE="http://{{ ansible_host }}:{{ panel_port }}{{ panel_request_prefix }}"
+    CSRF=$(curl -sS -c "{{ cookie_jar }}" "$BASE/csrf-token" \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["obj"])')
+    curl -sS -b "{{ cookie_jar }}" -c "{{ cookie_jar }}" -X POST \
       -H "Content-Type: application/x-www-form-urlencoded" \
+      -H "X-CSRF-Token: $CSRF" \
       --data-urlencode "username={{ panel_user }}" \
       --data-urlencode "password={{ panel_pass }}" \
-      "http://{{ ansible_host }}:{{ panel_port }}{{ panel_request_prefix }}/login" \
+      "$BASE/login" \
       | tee "{{ pipeline_state_dir }}/.login-final.json"
     python3 - <<'PY'
     import json
@@ -393,12 +277,16 @@
   delegate_to: localhost
   run_once: true
 
-- name: Submit inbounds to 3X-UI
+- name: Submit inbounds to 3X-UI (CSRF-aware)
   ansible.builtin.shell: |
     set -euo pipefail
+    BASE="http://{{ ansible_host }}:{{ panel_port }}{{ panel_request_prefix }}"
+    CSRF=$(curl -sS -b "{{ cookie_jar }}" -c "{{ cookie_jar }}" "$BASE/csrf-token" \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["obj"])')
     curl -sS -b "{{ cookie_jar }}" -H "Content-Type: application/json" \
+      -H "X-CSRF-Token: $CSRF" \
       -d @"{{ pipeline_state_dir }}/.payload-{{ item.name }}.json" \
-      "http://{{ ansible_host }}:{{ panel_port }}{{ panel_request_prefix }}/panel/api/inbounds/add" \
+      "$BASE/panel/api/inbounds/add" \
       | tee "{{ pipeline_state_dir }}/.inbound-{{ item.name }}.resp.json"
     python3 - <<'PY'
     import json

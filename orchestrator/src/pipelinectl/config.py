@@ -52,15 +52,27 @@ def _telegram_section(cfg: dict[str, Any]) -> dict[str, Any]:
     return sec if isinstance(sec, dict) else {}
 
 
+def _alerts_section(cfg: dict[str, Any]) -> dict[str, Any]:
+    sec = cfg.get("alerts")
+    return sec if isinstance(sec, dict) else {}
+
+
 def telegram_bot_token(cfg: dict[str, Any]) -> str:
+    """env TELEGRAM_BOT_TOKEN, then telegram.bot_token, then alerts.telegram_bot_token."""
     return (
         os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         or str(_telegram_section(cfg).get("bot_token") or "").strip()
+        or str(_alerts_section(cfg).get("telegram_bot_token") or "").strip()
     )
 
 
 def telegram_notify_chat_id(cfg: dict[str, Any]) -> str:
-    raw = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID") or _telegram_section(cfg).get("notify_chat_id")
+    """env TELEGRAM_NOTIFY_CHAT_ID, then telegram.notify_chat_id, then alerts.telegram_chat_id."""
+    raw = (
+        os.environ.get("TELEGRAM_NOTIFY_CHAT_ID")
+        or _telegram_section(cfg).get("notify_chat_id")
+        or _alerts_section(cfg).get("telegram_chat_id")
+    )
     return str(raw or "").strip()
 
 
@@ -75,3 +87,16 @@ def telegram_allowed_user_ids(cfg: dict[str, Any]) -> list[int]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def alerts_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """alerts: section with secrets overridable from the environment."""
+    a = dict(cfg.get("alerts") or {})
+    for key, env in (
+        ("smtp_pass", "PROXY_PIPELINE_SMTP_PASS"),
+        ("sms_ru_api_id", "PROXY_PIPELINE_SMSRU_API_ID"),
+    ):
+        v = os.environ.get(env, "").strip()
+        if v:
+            a[key] = v
+    return a

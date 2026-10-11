@@ -35,7 +35,7 @@ locals {
     systemctl enable --now fail2ban
 
     ARCH=$(uname -m)
-    case "${ARCH}" in
+    case "$${ARCH}" in
       x86_64 | x64 | amd64) XUI_ARCH="amd64" ;;
       i*86 | x86) XUI_ARCH="386" ;;
       armv8* | armv8 | arm64 | aarch64) XUI_ARCH="arm64" ;;
@@ -48,33 +48,33 @@ locals {
 
     if [[ -f /etc/os-release ]]; then
       . /etc/os-release
-      RELEASE_ID="${ID}"
+      RELEASE_ID="$${ID}"
     elif [[ -f /usr/lib/os-release ]]; then
       . /usr/lib/os-release
-      RELEASE_ID="${ID}"
+      RELEASE_ID="$${ID}"
     else
       echo "Unable to detect OS release" >&2
       exit 1
     fi
 
     TMP_DIR=$(mktemp -d)
-    trap 'rm -rf "${TMP_DIR}"' EXIT
-    wget -q -O "${TMP_DIR}/x-ui.tar.gz" "https://github.com/MHSanaei/3x-ui/releases/latest/download/x-ui-linux-${XUI_ARCH}.tar.gz"
-    tar -xzf "${TMP_DIR}/x-ui.tar.gz" -C "${TMP_DIR}"
-    chmod +x "${TMP_DIR}/x-ui/x-ui" "${TMP_DIR}"/x-ui/bin/xray-linux-* "${TMP_DIR}/x-ui/x-ui.sh"
-    install -m 0755 "${TMP_DIR}/x-ui/x-ui.sh" /usr/bin/x-ui
+    trap 'rm -rf "$${TMP_DIR}"' EXIT
+    wget -q -O "$${TMP_DIR}/x-ui.tar.gz" "https://github.com/MHSanaei/3x-ui/releases/latest/download/x-ui-linux-$${XUI_ARCH}.tar.gz"
+    tar -xzf "$${TMP_DIR}/x-ui.tar.gz" -C "$${TMP_DIR}"
+    chmod +x "$${TMP_DIR}/x-ui/x-ui" "$${TMP_DIR}"/x-ui/bin/xray-linux-* "$${TMP_DIR}/x-ui/x-ui.sh"
+    install -m 0755 "$${TMP_DIR}/x-ui/x-ui.sh" /usr/bin/x-ui
 
-    if [[ -f "${TMP_DIR}/x-ui/x-ui.service" ]]; then
-      install -m 0644 "${TMP_DIR}/x-ui/x-ui.service" /etc/systemd/system/x-ui.service
-    elif [[ "${RELEASE_ID}" == "ubuntu" || "${RELEASE_ID}" == "debian" || "${RELEASE_ID}" == "armbian" ]]; then
-      install -m 0644 "${TMP_DIR}/x-ui/x-ui.service.debian" /etc/systemd/system/x-ui.service
+    if [[ -f "$${TMP_DIR}/x-ui/x-ui.service" ]]; then
+      install -m 0644 "$${TMP_DIR}/x-ui/x-ui.service" /etc/systemd/system/x-ui.service
+    elif [[ "$${RELEASE_ID}" == "ubuntu" || "$${RELEASE_ID}" == "debian" || "$${RELEASE_ID}" == "armbian" ]]; then
+      install -m 0644 "$${TMP_DIR}/x-ui/x-ui.service.debian" /etc/systemd/system/x-ui.service
     else
-      install -m 0644 "${TMP_DIR}/x-ui/x-ui.service.rhel" /etc/systemd/system/x-ui.service
+      install -m 0644 "$${TMP_DIR}/x-ui/x-ui.service.rhel" /etc/systemd/system/x-ui.service
     fi
 
     systemctl stop x-ui >/dev/null 2>&1 || true
     rm -rf /usr/local/x-ui
-    mv "${TMP_DIR}/x-ui" /usr/local/
+    mv "$${TMP_DIR}/x-ui" /usr/local/
     systemctl daemon-reload
     systemctl enable x-ui
     systemctl restart x-ui
@@ -101,6 +101,10 @@ resource "cherryservers_server" "exit" {
 
   lifecycle {
     ignore_changes = [hostname]
+    # Create the replacement first, destroy the old Exit only once it exists: an out-of-stock
+    # region (Cherry API 400 "Server is out of stock", 2026-09-08) must not leave the chain
+    # without an Exit.
+    create_before_destroy = true
   }
 }
 

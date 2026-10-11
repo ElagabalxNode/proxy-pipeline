@@ -58,7 +58,8 @@ state/                      # локальные runtime-артефакты (git
 Root stack поднимает:
 
 - модуль `exit_cherry`
-- модуль `bridge_yandex` только если `enable_yandex_bridge=true`
+- модуль `bridge_timeweb` если `enable_timeweb_bridge=true` (рекомендуемый RU-бридж)
+- модуль `bridge_yandex` если `enable_yandex_bridge=true` (legacy / fallback)
 
 Ключевые outputs:
 
@@ -137,17 +138,104 @@ pipelinectl links --format json
 pipelinectl links --no-export
 ```
 
-### 5. Rotate
+### 4b. Chain probe — где именно встала цепочка
 
-`pipelinectl rotate` пересоздаёт целевую ноду через Terraform и затем повторяет `configure`.
-
-Поддерживается:
+Роль моста ставит на мост systemd-timer `chain-probe` (раз в минуту, три замера в JSONL
+`/var/log/chain-probe/probe.jsonl`): `tls_exit` — TLS-рукопожатие мост→Exit (хоп через границу),
+`chain_http` — HTTP сквозь всю цепочку через loopback-SOCKS `127.0.0.1:1080`, `direct_http` — тот же
+запрос с моста напрямую, минуя Exit (`127.0.0.1:1081`, контроль). Контроллер зеркалит лог в
+`state/probe/` (timer `proxy-pipeline-probe-pull`, раз в 5 мин). Когда клиенты жалуются:
 
 ```bash
-pipelinectl rotate exit
-pipelinectl rotate bridge
-pipelinectl rotate all
+pipelinectl chainlog                    # сводка за 24h: fail%, p50/p95 и окна сбоев с вердиктом
+pipelinectl chainlog --since 7d --pull  # забрать лог с моста сейчас и посмотреть неделю
 ```
+
+Четвёртый замер — `dest_tls`: TLS до **собственного Reality-dest моста**. xray дозванивает dest на
+каждое клиентское рукопожатие через системный резолвер, и если CDN-edge оттуда недоступен, клиенты
+видят `-1`/минутные коннекты при полностью здоровой цепочке (11.09.2026: `www.nvidia.com` из YC).
+Поэтому системный резолвер моста, `dns` xray и зонд используют один список `bridge_dns_servers`
+(по умолчанию Яндекс-DNS — RU-steering CDN даёт edge'ы, достижимые из YC).
+
+Вердикт по окну: упали `chain_http`+`direct_http` → egress моста / граница (клиенты лежат);
+`chain_http`+`tls_exit` → хоп мост→Exit (DPI или Exit мёртв); только `chain_http` → сторона Exit;
+только `dest_tls` → Reality-dest недоступен с моста (сменить `--bridge-dest`/`--bridge-sni`).
+
+`pipelinectl validate --deep` теперь прогоняет один раунд зонда **на мосту** и печатает его как
+`bridge_tls_exit`/`bridge_chain_http`/`bridge_direct_http`/`bridge_dest_tls`; `rotate` заканчивается
+этим же чеком и завершается с ошибкой, если цепочка настроена, но трафик не идёт.
+
+**Файрвол Exit'а (роль `exit_firewall`, идемпотентна, применяется в конце `configure`/`rotate`
+или отдельно: `pipelinectl configure --exit-firewall-only`).** Снаружи Exit пуст: 443/8388/8443 —
+только с моста и контроллера, 22/2053 — только с контроллера (панель 3X-UI наружу закрыта; свой IP
+для SSH — `exit_fw_extra_admin_cidrs`, SSH на весь мир — `exit_fw_ssh_world: true`). Защита от
+самоблокировки: перед включением ставится таймер `ufw disable` через 5 минут, который снимается
+только после успешной **новой** SSH-сессии с контроллера. Прямые (`Direct-*`) ссылки после этого
+работают только с моста/контроллера — клиенты всегда идут через мост.
+
+**Алерты (`pipelinectl alert-check`, таймер `proxy-pipeline-alert` на контроллере раз в 5 мин).**
+По зеркалу лога зонда: 3 подряд раунда с упавшим хопом/цепочкой → `DOWN` (с вердиктом и с какого
+времени), нет раундов 15 мин → `NO DATA`, потом `RECOVERED`; каждое событие один раз, напоминание
+о `DOWN` раз в 6 ч. Каналы, которые доходят до телефона в РФ **без VPN**: e-mail (SMTP с app-паролем,
+`alerts.email_to/smtp_*`) и SMS через sms.ru (`alerts.sms_ru_api_id/sms_to`); Telegram — если задан,
+но он при лежащей цепочке из РФ недоступен. Секреты — `PROXY_PIPELINE_SMTP_PASS`,
+`PROXY_PIPELINE_SMSRU_API_ID`. Проверка без отправки: `pipelinectl alert-check --dry-run`.
+
+**Вотчдог (`pipelinectl watchdog`, тот же таймер `proxy-pipeline-alert`).** При `DOWN` по вине exit'а
+(вердикты «хоп» / «сторона Exit») сам чинит: подтверждает сбой **живым** раундом зонда на мосту
+(зеркало может отставать на 5 мин), затем `rotate exit --yes` в том же регионе — со всеми гейтами
+и перекатами, — затем по очереди `watchdog.fallback_regions`; алерт уходит **только если все попытки
+провалились** (или ротация не поможет: умер egress моста / мост недоступен). Ограничители:
+`cooldown_hours` (2), `max_per_day` (3), никогда параллельно с ручной ротацией
+(`state/.rotate.lock`). Об успешной авто-ротации приходит короткое письмо (`notify_on_success`).
+Логи попыток — `state/watchdog/rotate-YYYYMMDD.log`. Без ротации: `pipelinectl alert-check`;
+сухой прогон: `pipelinectl watchdog --dry-run`.
+
+Reality-SNI/dest моста: `pipelinectl configure --bridge-only --bridge-dest 80.239.254.22:443`
+(только dest, QR не меняется) или `--bridge-sni download.docker.com` (меняется `sni=` → новый QR).
+
+### 5. Rotate
+
+`pipelinectl rotate` пересоздаёт ноды и сразу перевыпускает ссылки/QR — тонкая обёртка над
+`scripts/rotate-chain.sh` (одна команда на всю ротацию). Делает: активацию `.venv`, Yandex-auth
+из `config/key.json`, защиту от мёртвого Timeweb в стейте и несовместимого с регионом плана,
+`terraform apply -replace`, ожидание SSH, ре-пробу Reality, `configure` и `links --qr`.
+
+```bash
+pipelinectl rotate all                  # Exit + YC-мост (по умолчанию)
+pipelinectl rotate exit                 # только Exit
+pipelinectl rotate bridge               # только мост
+pipelinectl rotate all --region SE-Stockholm --plan B2-1-1gb-20s-shared   # со сменой региона
+pipelinectl rotate all --yes            # без интерактивного подтверждения terraform
+
+# Сменить локацию Exit: сначала посмотреть живое наличие по регионам (Cherry API)…
+pipelinectl stock                       # сток текущего exit_plan по регионам + подсказка команды
+pipelinectl stock --all                 # все cloud-VPS планы (B1-* только LT/NL/US/SG, B2-* везде)
+# Репутация IP (InternetDB, без ключа): чужие порты/теги malware/чужие hostnames = «грязный» адрес
+pipelinectl ipcheck 84.32.104.161        # DIRTY — previous tenant's services on ports [111, 137, …]
+# …затем ротировать в выбранный регион (скрипт сам перепроверит сток, достижимость с моста
+# и репутацию нового IP, перекатывая exit до 4 раз):
+pipelinectl rotate exit --region NL-Amsterdam
+pipelinectl rotate exit --region LT-Siauliai --plan B1-1-1gb-20s-shared
+
+# Эквивалентно напрямую:
+scripts/rotate-chain.sh all
+```
+
+По умолчанию `terraform apply` спрашивает подтверждение один раз. В конце печатается QR —
+клиенту отдавать `.client-links-qr/bridge_vless.png`.
+
+**Клиентский QR не меняется ни при какой ротации, кроме явного `--new-ip`.** У моста
+зарезервированный (статический) публичный IP — `yandex_vpc_address`, переживает пересоздание VM, —
+а его identity (uuid, ключ Reality, shortId, SNI, пароль SS) роль моста переиспользует: читает с
+живого моста (`/usr/local/etc/xray/config.json`), а для пересозданной VM — из копии
+`state/bridge_identity.json`. `rotate exit` лишь перенацеливает outbound моста на новый Exit;
+`rotate bridge|all` пересоздаёт VM моста за тем же IP с той же identity. Скрипт сверяет
+bridge-ссылки до/после и печатает `UNCHANGED`. Новый QR — только по `rotate bridge --new-ip`
+(новый адрес + новая identity). Резерв адреса ничего не стоит, пока он привязан к работающей VM
+(0.26 ₽/ч, как и динамический); за *неиспользуемый* зарезервированный адрес YC берёт ещё ~0.34 ₽/ч.
+Подробности и ручные фазы:
+[`docs/RUNBOOK-ROTATE-CHAIN.md`](docs/RUNBOOK-ROTATE-CHAIN.md).
 
 ## Быстрый старт
 
@@ -180,7 +268,23 @@ export TF_VAR_panel_pass="..."
 export PROXY_PIPELINE_PANEL_PASS="$TF_VAR_panel_pass"
 ```
 
-Опционально для Yandex Bridge:
+Опционально для Timeweb Bridge (рекомендуемый RU-бридж, дешевле Yandex):
+
+```bash
+export TWC_TOKEN="..."   # панель Timeweb -> «API и Terraform»
+```
+
+В `terraform/terraform.tfvars`:
+
+```hcl
+enable_timeweb_bridge         = true
+timeweb_configurator_location = "ru-2"   # ru-1=СПб, ru-2=Москва
+timeweb_availability_zone     = "msk-1"  # "" если аккаунт не даёт выбрать зону
+```
+
+⚠️ У токена Timeweb включите «удалять сервисы по API без кода в Телеграме», иначе `terraform destroy` / `pipelinectl rotate` зависнут. Подробный ранбук миграции: [`docs/RUNBOOK-TIMEWEB.md`](docs/RUNBOOK-TIMEWEB.md).
+
+Опционально для Yandex Bridge (legacy / fallback):
 
 ```bash
 export YC_TOKEN="..."
@@ -197,7 +301,7 @@ yandex_subnet_id     = "..."
 yandex_zone          = "ru-central1-a"
 ```
 
-Важно: модуль Bridge сейчас ожидает **готовый subnet с NAT / внешним доступом**. Создание VPC и security group автоматически ещё не добавлено.
+Важно: модуль Yandex Bridge ожидает **готовый subnet с NAT / внешним доступом** (Timeweb-модуль этого не требует — публичный IP выдаётся серверу). Создание VPC и security group автоматически ещё не добавлено.
 
 ### 4. Установите `pipelinectl`
 
@@ -238,6 +342,7 @@ pipelinectl links
 - `exit_region`
 - `exit_plan`
 - `exit_image`
+- `enable_timeweb_bridge`, `timeweb_configurator_location`, `timeweb_availability_zone`, `timeweb_cpu`, `timeweb_ram_mb`, `timeweb_disk_mb`
 - `enable_yandex_bridge`
 - `yandex_folder_id`
 - `yandex_subnet_id`
@@ -258,7 +363,19 @@ pipelinectl links
 
 ### Bridge
 
-Модуль [`terraform/modules/bridge_yandex`](terraform/modules/bridge_yandex):
+Два взаимозаменяемых модуля, выбираются флагами `enable_*_bridge`. Оба отдают
+одинаковые outputs (`external_ip`, `instance_id`, `ssh_user`), поэтому роль
+`bridge_xray_relay`, `configure`/`validate`/`links` от провайдера не зависят. В
+outputs Timeweb приоритетнее Yandex (полезно при бесшовном переключении).
+
+Модуль [`terraform/modules/bridge_timeweb`](terraform/modules/bridge_timeweb) — RU-бридж на Timeweb Cloud (рекомендуемый):
+
+- `twc_server.bridge` + `twc_ssh_key.bridge`
+- размер через `configuration { configurator_id, cpu, ram, disk }` (ram/disk в МБ)
+- публичный IPv4 — `main_ipv4` (отдельный платный ресурс у Timeweb, выдаётся серверу)
+- SSH user `root`
+
+Модуль [`terraform/modules/bridge_yandex`](terraform/modules/bridge_yandex) — legacy / fallback:
 
 - `yandex_compute_instance.bridge`
 - Ubuntu image family

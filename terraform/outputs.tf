@@ -18,21 +18,28 @@ output "ssh_command" {
   value       = module.exit.ssh_command
 }
 
+# Active bridge = Timeweb if enabled, else Yandex, else none. During a zero-downtime
+# cutover both modules may be up at once; Timeweb wins so clients move to it first.
 output "bridge_ip" {
-  description = "Yandex bridge public IP (empty if enable_yandex_bridge=false)"
-  value       = try(module.bridge[0].external_ip, "")
+  description = "Active bridge public IP (Timeweb > Yandex; empty if no bridge)"
+  value       = try(module.bridge_timeweb[0].external_ip, try(module.bridge[0].external_ip, ""))
 }
 
 output "bridge_instance_id" {
-  description = "Yandex instance id (empty if bridge disabled)"
-  value       = try(module.bridge[0].instance_id, "")
+  description = "Active bridge instance id (empty if no bridge)"
+  value       = try(module.bridge_timeweb[0].instance_id, try(module.bridge[0].instance_id, ""))
 }
 
 output "bridge_ssh_user" {
-  description = "SSH user for bridge VM"
-  value       = try(module.bridge[0].ssh_user, "")
+  description = "SSH user for the active bridge VM (root on Timeweb, ubuntu on Yandex)"
+  value       = try(module.bridge_timeweb[0].ssh_user, try(module.bridge[0].ssh_user, ""))
 }
 
 output "pipeline_contract_version" {
   value = 1
+}
+
+output "bridge_address_id" {
+  description = "Reserved (static) public address of the YC bridge — survives VM rebuilds"
+  value       = try(module.bridge[0].address_id, "")
 }

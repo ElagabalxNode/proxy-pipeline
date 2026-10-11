@@ -9,5 +9,9 @@ terraform {
       source  = "yandex-cloud/yandex"
       version = "~> 0.130"
     }
+    twc = {
+      source  = "timeweb-cloud/timeweb-cloud"
+      version = "~> 1.7"
+    }
   }
 }

@@ -4,17 +4,20 @@
     "access": "/var/log/xray/access.log",
     "error": "/var/log/xray/error.log"
   },
+{# The bridge's own lookups only (client destinations pass through AsIs and are resolved on the
+   Exit). What matters here is the Reality dest, dialed on every client handshake: resolve it
+   through the cloud's local resolver so the CDN steers us to edges reachable from THIS network.
+   2026-09-11: Cloudflare DoH from Yandex Cloud returned an Akamai cluster (139.45.206-207.x) that
+   flapped/blackholed from YC, so every client handshake hung; the YC resolver also handed out one
+   dead edge of that cluster. Yandex public DNS steered to RU-side Akamai edges that all answered. #}
   "dns": {
-    "servers": [
-      "https+local://1.1.1.1/dns-query",
-      "localhost"
-    ]
+    "servers": {{ bridge_dns_servers | to_json }}
   },
   "inbounds": [
     {
       "tag": "vless-reality-in",
       "listen": "0.0.0.0",
-      "port": 443,
+      "port": {{ bridge_reality_port | default(443) | int }},
       "protocol": "vless",
       "settings": {
         "clients": [
@@ -31,9 +34,9 @@
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "{{ reality_sni }}:443",
+          "dest": "{{ bridge_reality_dest }}",
           "xver": 0,
-          "serverNames": ["{{ reality_sni }}"],
+          "serverNames": ["{{ bridge_reality_sni }}"],
           "privateKey": "{{ bridge_private_key }}",
           "shortIds": ["{{ bridge_short_id }}"]
         }
@@ -49,17 +52,50 @@
       "port": {{ ss_port | int }},
       "protocol": "shadowsocks",
       "settings": {
-        "method": "{{ ss_method }}",
-        "password": "{{ ss_password }}",
+        "method": "{{ bridge_ss_method }}",
+        "password": "{{ bridge_ss_password }}",
         "network": "tcp,udp"
       },
       "sniffing": {
         "enabled": true,
         "destOverride": ["http", "tls", "quic"]
       }
+    },
+{# Loopback-only SOCKS inbounds for chain-probe.sh (never reachable from outside):
+   probe-in        -> default route -> chain-to-exit -> Exit -> internet (the whole chain)
+   probe-direct-in -> routed to `direct` below: the bridge's own egress, no Exit (reference) #}
+    {
+      "tag": "probe-in",
+      "listen": "127.0.0.1",
+      "port": {{ chain_probe_socks_port | default(1080) | int }},
+      "protocol": "socks",
+      "settings": { "auth": "noauth", "udp": false }
+    },
+    {
+      "tag": "probe-direct-in",
+      "listen": "127.0.0.1",
+      "port": {{ chain_probe_direct_port | default(1081) | int }},
+      "protocol": "socks",
+      "settings": { "auth": "noauth", "udp": false }
     }
   ],
   "outbounds": [
+{% if bridge_chain_mode == "ss" %}
+    {
+      "tag": "chain-to-exit",
+      "protocol": "shadowsocks",
+      "settings": {
+        "servers": [
+          {
+            "address": "{{ exit_ip }}",
+            "port": {{ ss_port | int }},
+            "method": "{{ ss_method }}",
+            "password": "{{ ss_password }}"
+          }
+        ]
+      }
+    },
+{% else %}
     {
       "tag": "chain-to-exit",
       "protocol": "vless",
@@ -84,7 +120,7 @@
         "realitySettings": {
           "show": false,
           "fingerprint": "chrome",
-          "serverName": "{{ reality_sni }}",
+          "serverName": "{{ exit_reality_sni }}",
           "publicKey": "{{ exit_public_key }}",
           "shortId": "{{ exit_short_id }}",
           "spiderX": ""
@@ -95,6 +131,7 @@
         }
       }
     },
+{% endif %}
     {
       "tag": "direct",
       "protocol": "freedom",
@@ -118,6 +155,11 @@
         "type": "field",
         "outboundTag": "direct",
         "ip": ["geoip:private"]
+      },
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "inboundTag": ["probe-direct-in"]
       },
       {
         "type": "field",

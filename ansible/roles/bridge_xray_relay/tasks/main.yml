@@ -33,23 +33,153 @@
   ansible.builtin.command: sysctl -p /etc/sysctl.d/99-bbr.conf
   changed_when: false
 
-- name: Generate Bridge Reality keys
-  ansible.builtin.shell: xray x25519
+# ── Client-facing identity: reuse what the bridge already serves ──────────────────
+# Clients only ever hold the *bridge* link/QR (uuid, pbk, sid, sni and the SS password,
+# all @ bridge_ip). An Exit rotation must re-point the bridge's outbound at the new Exit
+# without touching that identity, or every client has to re-import the QR. So if the
+# bridge already runs an Xray config, read its identity back and reuse it; only a fresh
+# bridge (no config yet) gets new keys. The private key never leaves the bridge.
+- name: Read existing Bridge client-facing identity (kept across Exit rotations)
+  ansible.builtin.shell: |
+    python3 - <<'PY'
+    import json
+    out = {}
+    try:
+        cfg = json.load(open("/usr/local/etc/xray/config.json"))
+        for ib in cfg.get("inbounds", []):
+            st = ib.get("settings", {})
+            rs = ib.get("streamSettings", {}).get("realitySettings", {})
+            if (ib.get("protocol") == "vless" and rs.get("privateKey") and st.get("clients")
+                    and rs.get("shortIds") and rs.get("serverNames")):
+                out.update(uuid=st["clients"][0]["id"], private_key=rs["privateKey"],
+                           short_id=rs["shortIds"][0], sni=rs["serverNames"][0],
+                           dest=rs.get("dest", ""))
+            elif ib.get("protocol") == "shadowsocks" and st.get("password"):
+                out.update(ss_password=st["password"], ss_method=st.get("method", ""))
+    except Exception:  # no/corrupt config -> fresh identity
+        out = {}
+    print(json.dumps(out))
+    PY
+  args: { executable: /bin/bash }
+  register: bridge_identity_raw
+  changed_when: false
+  no_log: true
+
+- name: Parse live Bridge identity
+  ansible.builtin.set_fact:
+    bridge_live: "{{ bridge_identity_raw.stdout | from_json }}"
+  no_log: true
+
+# Second source: the copy the previous run left on the controller. It is what lets a REBUILT
+# bridge VM (rotate bridge / rotate all — reserved IP kept) come back with the same identity, so
+# the client QR survives even that. `rotate bridge --new-ip` deletes it to force a fresh one.
+- name: Read Bridge identity backup from the controller
+  ansible.builtin.shell: |
+    python3 - "{{ pipeline_state_dir }}/bridge_identity.json" <<'PY'
+    import json, sys
+    try:
+        d = json.load(open(sys.argv[1]))
+        print(json.dumps(d if all(d.get(k) for k in ("uuid", "private_key", "short_id", "sni")) else {}))
+    except Exception:  # no backup yet -> nothing to restore
+        print("{}")
+    PY
+  args: { executable: /bin/bash }
+  delegate_to: localhost
+  run_once: true
+  register: bridge_backup_raw
+  changed_when: false
+  no_log: true
+
+- name: Choose Bridge identity source (live config > controller backup > generate)
+  ansible.builtin.set_fact:
+    bridge_existing: "{{ bridge_live if bridge_live.private_key is defined else (bridge_backup_raw.stdout | from_json) }}"
+    bridge_identity_source: "{{ 'live Xray config' if bridge_live.private_key is defined else ('controller backup (rebuilt VM)' if (bridge_backup_raw.stdout | from_json).private_key is defined else 'none') }}"
+  no_log: true
+
+- name: Report Bridge identity mode
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'REUSING bridge identity from ' ~ bridge_identity_source ~ ' (client links stay valid): uuid='
+         ~ bridge_existing.uuid ~ ' sid=' ~ bridge_existing.short_id ~ ' sni=' ~ bridge_existing.sni
+         if bridge_existing.private_key is defined
+         else 'No live config and no controller backup - generating a NEW identity (client links WILL change)' }}
+
+# One task for both paths: `register` on two mutually exclusive tasks would leave the
+# skipped one's result in bridge_x25519. `xray x25519 -i <priv>` prints the matching pair.
+- name: Bridge Reality keypair (derive from existing private key, or generate for a fresh bridge)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if [ -n "$BRIDGE_PRIV" ]; then xray x25519 -i "$BRIDGE_PRIV"; else xray x25519; fi
+  args: { executable: /bin/bash }
+  environment:
+    BRIDGE_PRIV: "{{ bridge_existing.private_key | default('') }}"
   register: bridge_x25519
   changed_when: false
+  no_log: true
 
 - name: Parse Bridge keys
   ansible.builtin.set_fact:
     bridge_private_key: "{{ (bridge_x25519.stdout_lines | select('search', 'Private') | list | first).split() | last }}"
     bridge_public_key: "{{ (bridge_x25519.stdout_lines | select('search', 'Public') | list | first).split() | last }}"
+  no_log: true
 
-- name: Bridge client UUID
+- name: Fail if Bridge keys empty
+  ansible.builtin.fail:
+    msg: "Could not parse 'xray x25519' output on the bridge (private={{ bridge_private_key | length }} chars, public={{ bridge_public_key | length }} chars)"
+  when: bridge_private_key | length < 10 or bridge_public_key | length < 10
+
+- name: Generate Bridge client identity (fresh bridge only)
   ansible.builtin.set_fact:
     bridge_client_uuid: "{{ lookup('pipe', 'cat /proc/sys/kernel/random/uuid') }}"
-
-- name: Bridge shortId
-  ansible.builtin.set_fact:
     bridge_short_id: "{{ lookup('pipe', 'openssl rand -hex 4') }}"
+    # Client-facing Reality SNI of the bridge inbound, seeded from the Exit's on first setup.
+    # From then on it is decoupled: a re-probed Exit changes only the outbound serverName.
+    bridge_reality_sni: "{{ exit_state.reality_sni }}"
+    bridge_reality_dest: "{{ exit_state.reality_sni }}:443"
+    # Bridge SS inbound creds, seeded from the Exit's. The bridge decrypts SS itself and relays
+    # over the chain, so they need not track the Exit's SS inbound afterwards.
+    bridge_ss_method: "{{ exit_state.ss_method }}"
+    bridge_ss_password: "{{ exit_state.ss_password }}"
+  when: bridge_existing.private_key is not defined
+
+- name: Reuse Bridge client identity (existing bridge)
+  ansible.builtin.set_fact:
+    bridge_client_uuid: "{{ bridge_existing.uuid }}"
+    bridge_short_id: "{{ bridge_existing.short_id }}"
+    bridge_reality_sni: "{{ bridge_existing.sni }}"
+    bridge_reality_dest: "{{ bridge_existing.dest | default(bridge_existing.sni ~ ':443', true) }}"
+    bridge_ss_method: "{{ bridge_existing.ss_method | default(exit_state.ss_method, true) }}"
+    bridge_ss_password: "{{ bridge_existing.ss_password | default(exit_state.ss_password) }}"
+  when: bridge_existing.private_key is defined
+
+# Operator overrides. The Reality dest is dialed by the bridge on EVERY client handshake, so it
+# must be fast from the bridge's own network — 2026-09-11: an inherited www.nvidia.com did not
+# answer Yandex Cloud at all and every client handshake hung. Changing the SNI changes the
+# client QR (sni=); changing only the dest (e.g. to a reachable edge IP) does not.
+- name: Apply Bridge Reality SNI/dest overrides
+  ansible.builtin.set_fact:
+    bridge_reality_sni: "{{ bridge_reality_sni_override | default(bridge_reality_sni, true) }}"
+    bridge_reality_dest: >-
+      {{ bridge_reality_dest_override | default(
+           (bridge_reality_sni_override ~ ':443') if (bridge_reality_sni_override | default('', true)) else bridge_reality_dest,
+         true) }}
+
+- name: Ensure /etc/systemd/resolved.conf.d exists
+  ansible.builtin.file:
+    path: /etc/systemd/resolved.conf.d
+    state: directory
+    mode: "0755"
+
+- name: System resolver = bridge_dns_servers (xray dials the Reality dest through the OS resolver)
+  ansible.builtin.template:
+    src: resolved-dns.conf.j2
+    dest: /etc/systemd/resolved.conf.d/proxy-pipeline-dns.conf
+    mode: "0644"
+  notify: Restart systemd-resolved
+
+- name: Resolver the chain probe uses for the Reality dest (xray's first plain-IP DNS server)
+  ansible.builtin.set_fact:
+    bridge_dest_resolver: "{{ (bridge_dns_servers | select('match', '^[0-9.]+$') | list | first) | default('', true) }}"
 
 - name: Install Xray config
   ansible.builtin.template:
@@ -62,20 +192,26 @@
     chain_uuid: "{{ exit_state.chain_uuid }}"
     exit_public_key: "{{ exit_state.public_key }}"
     exit_short_id: "{{ exit_state.short_id }}"
-    reality_sni: "{{ exit_state.reality_sni }}"
+    exit_reality_sni: "{{ exit_state.reality_sni }}"
     ss_method: "{{ exit_state.ss_method }}"
     ss_password: "{{ exit_state.ss_password }}"
     ss_port: "{{ exit_state.ss_port | int }}"
+  notify: Restart Xray
 
-- name: Enable and restart Xray
+# Restart only when the config actually changed (handler), so an idempotent re-run — e.g. one
+# that touched nothing on the bridge — does not drop live client connections.
+- name: Enable and start Xray
   ansible.builtin.systemd:
     name: xray
     enabled: true
-    state: restarted
+    state: started
 
-- name: Wait for Xray on 443
+- name: Apply a pending Xray restart before checking the port
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for Xray on the client VLESS port
   ansible.builtin.wait_for:
-    port: 443
+    port: "{{ bridge_reality_port | default(443) | int }}"
     timeout: 60
 
 - name: Write bridge runtime for clients (controller)
@@ -85,3 +221,96 @@
     mode: "0600"
   delegate_to: localhost
   run_once: true
+
+- name: Save Bridge identity backup on the controller (restores a rebuilt VM with the same QR)
+  ansible.builtin.template:
+    src: bridge_identity.json.j2
+    dest: "{{ pipeline_state_dir }}/bridge_identity.json"
+    mode: "0600"
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+
+# ── Chain probe (bridge) + log mirror (controller). See templates/chain-probe.sh.j2 for what
+#    each check means. Re-templated on every run, so a rotated Exit/IP is picked up automatically.
+- name: Install chain probe script
+  ansible.builtin.template:
+    src: chain-probe.sh.j2
+    dest: /usr/local/bin/chain-probe.sh
+    mode: "0755"
+  when: chain_probe_enabled | bool
+
+- name: Install chain probe systemd units and logrotate
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - { src: chain-probe.service.j2, dest: /etc/systemd/system/chain-probe.service }
+    - { src: chain-probe.timer.j2, dest: /etc/systemd/system/chain-probe.timer }
+    - { src: chain-probe.logrotate.j2, dest: /etc/logrotate.d/chain-probe }
+  when: chain_probe_enabled | bool
+
+- name: Enable chain probe timer
+  ansible.builtin.systemd:
+    daemon_reload: true
+    name: chain-probe.timer
+    enabled: true
+    state: started
+  when: chain_probe_enabled | bool
+
+- name: Probe log mirror directory on the controller
+  ansible.builtin.file:
+    path: "{{ chain_probe_pull_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  run_once: true
+  when: chain_probe_enabled | bool
+
+- name: Install probe-log pull units on the controller
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - { src: probe-pull.service.j2, dest: /etc/systemd/system/proxy-pipeline-probe-pull.service }
+    - { src: probe-pull.timer.j2, dest: /etc/systemd/system/proxy-pipeline-probe-pull.timer }
+  delegate_to: localhost
+  run_once: true
+  when: chain_probe_enabled | bool
+
+- name: Enable probe-log pull timer on the controller
+  ansible.builtin.systemd:
+    daemon_reload: true
+    name: proxy-pipeline-probe-pull.timer
+    enabled: true
+    state: started
+  delegate_to: localhost
+  run_once: true
+  when: chain_probe_enabled | bool
+
+- name: Install alert units on the controller (chain DOWN / NO DATA → e-mail, SMS, Telegram)
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "0644"
+  vars:
+    pipeline_repo_root: "{{ (pipeline_state_dir ~ '/..') | realpath }}"
+  loop:
+    - { src: alert.service.j2, dest: /etc/systemd/system/proxy-pipeline-alert.service }
+    - { src: alert.timer.j2, dest: /etc/systemd/system/proxy-pipeline-alert.timer }
+  delegate_to: localhost
+  run_once: true
+  when: chain_probe_enabled | bool
+
+- name: Enable alert timer on the controller
+  ansible.builtin.systemd:
+    daemon_reload: true
+    name: proxy-pipeline-alert.timer
+    enabled: true
+    state: started
+  delegate_to: localhost
+  run_once: true
+  when: chain_probe_enabled | bool
+

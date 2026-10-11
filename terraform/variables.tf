@@ -17,7 +17,7 @@ variable "exit_region" {
 
   validation {
     condition = contains(
-      ["LT-Siauliai", "NL-Amsterdam", "US-Chicago", "SG-Singapore", "SE-Stockholm", "DE-Frankfurt"],
+      ["LT-Siauliai", "NL-Amsterdam", "US-Chicago", "SG-Singapore", "SE-Stockholm", "DE-Frankfurt", "JP-Tokyo"],
       var.exit_region
     )
     error_message = "Unknown exit_region slug. Use Cherry GET /v1/regions."
@@ -101,4 +101,41 @@ variable "yandex_memory_gb" {
 variable "yandex_disk_gb" {
   type    = number
   default = 20
+}
+
+# --- Timeweb Cloud (Bridge) — optional stack slice ---
+variable "enable_timeweb_bridge" {
+  description = "When true, provision a Timeweb Cloud VM for the RU bridge (requires TWC_TOKEN)"
+  type        = bool
+  default     = false
+}
+
+# Region for the sizing configurator: ru-1 (СПб), ru-2 (Москва), de-1, kz-1.
+variable "timeweb_configurator_location" {
+  type    = string
+  default = "ru-1"
+}
+
+# AZ slug (spb-1, msk-1, nsk-1, ...). Empty => let Timeweb pick (safe on accounts
+# without AZ selection).
+variable "timeweb_availability_zone" {
+  type    = string
+  default = ""
+}
+
+variable "timeweb_cpu" {
+  type    = number
+  default = 1
+}
+
+# Megabytes; ram must be divisible by 1024.
+variable "timeweb_ram_mb" {
+  type    = number
+  default = 1024
+}
+
+# Megabytes (15360 = 15 GB).
+variable "timeweb_disk_mb" {
+  type    = number
+  default = 15360
 }

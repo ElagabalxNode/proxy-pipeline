@@ -42,6 +42,7 @@ def run_playbook(
     playbook: Path,
     inventory: Path,
     extra_vars: dict[str, Any],
+    limit: str | None = None,
 ) -> None:
     with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as f:
         yaml.safe_dump(extra_vars, f, default_flow_style=False)
@@ -55,6 +56,8 @@ def run_playbook(
             "-e",
             f"@{extra_path}",
         ]
+        if limit:
+            cmd += ["--limit", limit]
         env = os.environ.copy()
         env["ANSIBLE_CONFIG"] = str((ansible_dir / "ansible.cfg").resolve())
         subprocess.run(cmd, cwd=str(ansible_dir), env=env, check=True)

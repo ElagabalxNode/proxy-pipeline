@@ -38,6 +38,18 @@ module "bridge" {
   disk_size_gb        = var.yandex_disk_gb
 }
 
+module "bridge_timeweb" {
+  count  = var.enable_timeweb_bridge ? 1 : 0
+  source = "./modules/bridge_timeweb"
+
+  ssh_public_key_path   = var.ssh_public_key_path
+  configurator_location = var.timeweb_configurator_location
+  availability_zone     = var.timeweb_availability_zone
+  cpu                   = var.timeweb_cpu
+  ram_mb                = var.timeweb_ram_mb
+  disk_mb               = var.timeweb_disk_mb
+}
+
 resource "terraform_data" "yandex_bridge_inputs" {
   lifecycle {
     precondition {

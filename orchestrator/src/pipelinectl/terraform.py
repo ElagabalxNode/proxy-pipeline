@@ -40,6 +40,18 @@ def terraform_destroy_targets(
         _run(cmd, tf_dir)
 
 
+def terraform_state_list(tf_dir: Path) -> list[str]:
+    """Return resource addresses currently in Terraform state (one per line)."""
+    proc = subprocess.run(
+        ["terraform", "state", "list"],
+        cwd=str(tf_dir),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
 def terraform_output_json(tf_dir: Path) -> dict[str, Any]:
     proc = subprocess.run(
         ["terraform", "output", "-json"],

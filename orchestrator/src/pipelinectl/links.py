@@ -37,9 +37,13 @@ def build_direct_ss(d: dict[str, Any]) -> str:
 def build_bridge_vless(d: dict[str, Any]) -> str | None:
     if not d.get("bridge_ip"):
         return None
+    port = d.get("bridge_reality_port") or 443
+    # The bridge keeps its own client-facing SNI across Exit rotations (bridge_runtime.json);
+    # a bridge_runtime.json written before that field existed used the Exit's.
+    sni = d.get("bridge_reality_sni") or d["reality_sni"]
     return (
-        f"vless://{d['bridge_uuid']}@{d['bridge_ip']}:443?encryption=none&flow=xtls-rprx-vision"
-        f"&security=reality&sni={d['reality_sni']}&fp=chrome&pbk={d['bridge_public_key']}&sid={d['bridge_short_id']}"
+        f"vless://{d['bridge_uuid']}@{d['bridge_ip']}:{port}?encryption=none&flow=xtls-rprx-vision"
+        f"&security=reality&sni={sni}&fp=chrome&pbk={d['bridge_public_key']}&sid={d['bridge_short_id']}"
         f"&type=tcp&headerType=none#Bridge-VLESS-{d['bridge_ip']}"
     )
 
@@ -47,9 +51,13 @@ def build_bridge_vless(d: dict[str, Any]) -> str | None:
 def build_bridge_ss(d: dict[str, Any]) -> str | None:
     if not d.get("bridge_ip"):
         return None
-    raw = f"{d['ss_method']}:{d['ss_password']}"
+    # Same: the bridge SS inbound has its own creds; fall back to the Exit's for old state files.
+    method = d.get("bridge_ss_method") or d["ss_method"]
+    password = d.get("bridge_ss_password") or d["ss_password"]
+    port = d.get("bridge_ss_port") or d["ss_port"]
+    raw = f"{method}:{password}"
     enc = base64.b64encode(raw.encode()).decode().rstrip("=")
-    return f"ss://{enc}@{d['bridge_ip']}:{d['ss_port']}#Bridge-SS2022-{d['bridge_ip']}"
+    return f"ss://{enc}@{d['bridge_ip']}:{port}#Bridge-SS2022-{d['bridge_ip']}"
 
 
 def build_client_links_map(d: dict[str, Any]) -> dict[str, str]:
