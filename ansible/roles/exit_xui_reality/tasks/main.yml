@@ -216,6 +216,85 @@
   run_once: true
   no_log: true
 
+# Idempotency: `inbounds/add` has no update/upsert and fails with "port already used"
+# when our three inbounds already exist. So before adding we list all inbounds and
+# delete only those whose remark matches our managed set — del-before-add BY REMARK,
+# never by port, so foreign inbounds on a shared panel are left untouched. The
+# remarks below must stay in sync with the `remark:` fields in the payload builder.
+- name: Managed inbound remarks (must match remarks in payload builder below)
+  ansible.builtin.set_fact:
+    managed_inbound_remarks:
+      - "VLESS-Reality-Vision"
+      - "SS2022-Fallback"
+      - "Chain-Bridge-Entry"
+
+- name: List existing inbounds (reuse CSRF session)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    BASE="http://{{ ansible_host }}:{{ panel_port }}{{ panel_request_prefix }}"
+    curl -sS -b "{{ cookie_jar }}" -c "{{ cookie_jar }}" \
+      "$BASE/panel/api/inbounds/list" \
+      | tee "{{ pipeline_state_dir }}/.inbounds-list.json" >/dev/null
+    python3 - <<'PY'
+    import json
+    d=json.load(open("{{ pipeline_state_dir }}/.inbounds-list.json"))
+    assert d.get("success") is True, d.get("msg")
+    PY
+  args:
+    executable: /bin/bash
+  register: inbounds_list
+  retries: 3
+  delay: 5
+  until: inbounds_list.rc == 0
+  delegate_to: localhost
+  run_once: true
+
+- name: Find existing managed inbound ids (match by remark)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    python3 - <<'PY'
+    import json
+    d = json.load(open("{{ pipeline_state_dir }}/.inbounds-list.json"))
+    managed = set(json.loads('{{ managed_inbound_remarks | to_json }}'))
+    ids = [str(o["id"]) for o in (d.get("obj") or []) if o.get("remark") in managed]
+    print(json.dumps(ids))
+    PY
+  args:
+    executable: /bin/bash
+  register: managed_inbound_ids_raw
+  changed_when: false
+  delegate_to: localhost
+  run_once: true
+
+- name: Store managed inbound ids
+  ansible.builtin.set_fact:
+    managed_inbound_ids: "{{ managed_inbound_ids_raw.stdout | from_json }}"
+
+- name: Delete existing managed inbounds (del-before-add by remark)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    BASE="http://{{ ansible_host }}:{{ panel_port }}{{ panel_request_prefix }}"
+    CSRF=$(curl -sS -b "{{ cookie_jar }}" -c "{{ cookie_jar }}" "$BASE/csrf-token" \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["obj"])')
+    curl -sS -b "{{ cookie_jar }}" -X POST \
+      -H "X-CSRF-Token: $CSRF" \
+      "$BASE/panel/api/inbounds/del/{{ item }}" \
+      | tee "{{ pipeline_state_dir }}/.inbound-del-{{ item }}.resp.json"
+    python3 - <<'PY'
+    import json
+    d=json.load(open("{{ pipeline_state_dir }}/.inbound-del-{{ item }}.resp.json"))
+    assert d.get("success") is True, d
+    PY
+  args:
+    executable: /bin/bash
+  register: inbounds_delete
+  retries: 3
+  delay: 5
+  until: inbounds_delete.rc == 0
+  loop: "{{ managed_inbound_ids }}"
+  delegate_to: localhost
+  run_once: true
+
 - name: Build inbound JSON payloads (jq)
   ansible.builtin.shell: |
     set -euo pipefail
