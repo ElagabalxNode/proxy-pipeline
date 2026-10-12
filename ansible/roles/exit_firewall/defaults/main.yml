@@ -1,0 +1,19 @@
+# The Exit exposes NOTHING to the internet. Clients always come through the bridge, automation
+# always comes from the controller, so every service is allow-listed to those two addresses:
+#   client ports (Reality 443, SS 8388, chain 8443)  <- bridge + controller
+#   admin ports  (SSH 22, 3X-UI panel 2053)          <- controller (+ exit_fw_extra_admin_cidrs)
+# 2026-09-12: the plain-HTTP panel and the proxy ports on a public IP were a Shodan/Netcraft
+# beacon ("VPN here") and an attack surface; the owner never uses the panel UI.
+exit_fw_bridge_ip: ""                     # set by pipelinectl configure (bridge_public_ip)
+exit_fw_extra_admin_cidrs: []            # e.g. ["203.0.113.5/32"] — your own IP for SSH/panel
+exit_fw_ssh_world: false                 # true = keep SSH open to the world (key-only anyway)
+exit_fw_client_ports:
+  - "{{ reality_port | default(443) }}"
+  - "{{ ss_port | default(8388) }}"
+  - "{{ chain_port | default(8443) }}"
+exit_fw_admin_ports:
+  - "22"
+  - "{{ panel_port | default('2053') }}"
+# Lockout guard: `ufw disable` is scheduled before enabling; cancelled only after a FRESH SSH
+# session from the controller succeeds through the new rules.
+exit_fw_safety_seconds: 300

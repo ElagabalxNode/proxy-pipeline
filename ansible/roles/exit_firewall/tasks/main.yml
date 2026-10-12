@@ -1,0 +1,79 @@
+---
+# Idempotent and standalone (playbooks/exit_firewall.yml) — unlike exit_xui_reality it can be
+# re-run on a live Exit. Rules are rebuilt from scratch on every run (ufw reset), so a rotated
+# bridge IP or a changed controller never leaves stale allows behind.
+
+- name: Controller IP as the Exit sees it (source of this SSH session)
+  ansible.builtin.shell: echo "${SSH_CONNECTION%% *}"
+  args: { executable: /bin/bash }
+  register: exit_fw_ctl
+  changed_when: false
+
+- name: Resolve allow-lists
+  ansible.builtin.set_fact:
+    exit_fw_controller_ip: "{{ exit_fw_ctl.stdout | trim }}"
+
+- name: Refuse to build a firewall that would lock out the controller or the bridge
+  ansible.builtin.fail:
+    msg: "controller ip='{{ exit_fw_controller_ip }}' bridge ip='{{ exit_fw_bridge_ip }}' — both are required"
+  when: exit_fw_controller_ip | length < 7 or exit_fw_bridge_ip | length < 7
+
+- name: Install ufw
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+    update_cache: true
+  environment: { DEBIAN_FRONTEND: noninteractive }
+
+- name: Arm the lockout guard (ufw disable in {{ exit_fw_safety_seconds }}s unless cancelled)
+  ansible.builtin.shell: |
+    systemctl stop exit-fw-safety.timer 2>/dev/null || true
+    systemd-run --on-active={{ exit_fw_safety_seconds }} --unit=exit-fw-safety --description="proxy-pipeline: undo ufw if the controller got locked out" /usr/sbin/ufw disable
+  args: { executable: /bin/bash }
+  changed_when: false
+
+- name: Rebuild ufw rules from scratch
+  ansible.builtin.shell: |
+    set -euo pipefail
+    ufw --force reset >/dev/null
+    ufw default deny incoming >/dev/null
+    ufw default allow outgoing >/dev/null
+    CTL="{{ exit_fw_controller_ip }}"; BR="{{ exit_fw_bridge_ip }}"
+    {% for p in exit_fw_admin_ports %}
+    ufw allow from "$CTL" to any port {{ p }} proto tcp comment 'controller' >/dev/null
+    {% for cidr in exit_fw_extra_admin_cidrs %}
+    ufw allow from {{ cidr }} to any port {{ p }} proto tcp comment 'extra admin' >/dev/null
+    {% endfor %}
+    {% endfor %}
+    ufw allow from "$BR" to any port 22 proto tcp comment 'bridge (rotation reachability check)' >/dev/null
+    {% if exit_fw_ssh_world %}
+    ufw allow 22/tcp comment 'ssh world (exit_fw_ssh_world)' >/dev/null
+    {% endif %}
+    {% for p in exit_fw_client_ports %}
+    ufw allow from "$BR"  to any port {{ p }} proto tcp comment 'bridge' >/dev/null
+    ufw allow from "$CTL" to any port {{ p }} proto tcp comment 'controller (validate)' >/dev/null
+    {% endfor %}
+    ufw --force enable >/dev/null
+    ufw status numbered
+  args: { executable: /bin/bash }
+  register: exit_fw_apply
+
+- name: A FRESH SSH session from the controller must still get in through the new rules
+  ansible.builtin.command: >
+    ssh -i {{ ansible_ssh_private_key_file }} -o StrictHostKeyChecking=no -o BatchMode=yes
+    -o ConnectTimeout=15 -o ControlPath=none {{ ansible_user }}@{{ ansible_host }} true
+  delegate_to: localhost
+  changed_when: false
+  register: exit_fw_fresh_ssh
+  retries: 3
+  delay: 5
+  until: exit_fw_fresh_ssh.rc == 0
+
+- name: Disarm the lockout guard
+  ansible.builtin.shell: systemctl stop exit-fw-safety.timer 2>/dev/null; systemctl reset-failed exit-fw-safety.service 2>/dev/null; true
+  args: { executable: /bin/bash }
+  changed_when: false
+
+- name: Firewall in effect
+  ansible.builtin.debug:
+    msg: "{{ exit_fw_apply.stdout_lines }}"
