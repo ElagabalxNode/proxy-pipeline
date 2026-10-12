@@ -160,7 +160,7 @@
   ansible.builtin.set_fact:
     vless_uuid: "{{ lookup('pipe', 'cat /proc/sys/kernel/random/uuid') }}"
     reality_short_id: "{{ lookup('pipe', 'openssl rand -hex 4') }}"
-    ss_password: "{{ lookup('pipe', 'openssl rand -base64 18 | tr -d \"\\n\"') }}"
+    ss_password: "{{ lookup('pipe', 'openssl rand -base64 16 | tr -d \"\\n\"') }}"
     chain_uuid: "{{ lookup('pipe', 'cat /proc/sys/kernel/random/uuid') }}"
 
 - name: Ensure state directory on controller
