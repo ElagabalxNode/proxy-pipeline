@@ -1,0 +1,6 @@
+[Unit]
+Description=proxy-pipeline: mirror the bridge chain-probe log into {{ chain_probe_pull_dir }}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rsync -az --timeout=60 -e "ssh -i {{ ansible_ssh_private_key_file }} -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15" {{ ansible_user | default('ubuntu') }}@{{ ansible_host }}:{{ chain_probe_log | dirname }}/ {{ chain_probe_pull_dir }}/

@@ -1,0 +1,7 @@
+[Unit]
+Description=proxy-pipeline chain probe (one measurement round)
+After=network-online.target xray.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/chain-probe.sh

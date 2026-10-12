@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# chain-probe — one measurement round from the bridge, appended as JSONL to {{ chain_probe_log }}.
+# Managed by Ansible (role bridge_xray_relay); chain-probe.timer runs it every {{ chain_probe_interval }}.
+# The controller mirrors the log directory into state/probe/ and `pipelinectl chainlog` reads it.
+#
+#   tls_exit     TLS handshake to the Exit's chain inbound {{ exit_state.exit_ip }}:{{ exit_state.chain_port }}
+#                (SNI {{ exit_state.reality_sni }}): the bridge->Exit hop alone — the leg that crosses the RU border.
+#   chain_http   GET {{ chain_probe_url }} through xray's loopback SOCKS `probe-in`
+#                -> chain-to-exit -> Exit -> internet: the whole chain minus the client leg.
+#   direct_http  the same GET through `probe-direct-in`, routed to `direct`: the bridge's own egress,
+#                no Exit. Reference: both fail -> bridge / RU border; only chain fails -> hop or Exit.
+#   dest_tls     TLS handshake to the bridge's OWN Reality dest ({{ bridge_reality_dest }}, SNI
+#                {{ bridge_reality_sni }}). xray dials it on every client handshake: if it is slow or
+#                dead from here, every client sees "-1" / minute-long connects even with a healthy chain.
+set -u
+DEST="{{ bridge_reality_dest }}"; DEST_SNI="{{ bridge_reality_sni }}"; DEST_RESOLVER="{{ bridge_dest_resolver | default('', true) }}"
+LOG="{{ chain_probe_log }}"
+EXIT_IP="{{ exit_state.exit_ip }}"; CHAIN_PORT="{{ exit_state.chain_port }}"; SNI="{{ exit_state.reality_sni }}"
+URL="{{ chain_probe_url }}"
+SOCKS_CHAIN="127.0.0.1:{{ chain_probe_socks_port }}"; SOCKS_DIRECT="127.0.0.1:{{ chain_probe_direct_port }}"
+T="{{ chain_probe_timeout }}"
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+mkdir -p "$(dirname "$LOG")"
+
+emit() { # check ok ms code err   (one JSON line; ts is shared by the whole round)
+  printf '{"ts":"%s","check":"%s","ok":%s,"ms":%s,"code":"%s","err":"%s"}\n' "$TS" "$1" "$2" "$3" "$4" "$5" >> "$LOG"
+}
+clean() { tr -d '"\\\n\r' | cut -c1-100; }
+ms_now() { date +%s%3N; }
+
+# 1) the hop: Reality answers a plain TLS client with the SNI's real certificate
+s=$(ms_now)
+out="$(timeout "$T" openssl s_client -connect "$EXIT_IP:$CHAIN_PORT" -servername "$SNI" -brief </dev/null 2>&1)"
+if grep -q "CONNECTION ESTABLISHED" <<<"$out"; then
+  emit tls_exit true "$(( $(ms_now) - s ))" "" ""
+else
+  emit tls_exit false "$(( $(ms_now) - s ))" "" "$(tail -n1 <<<"$out" | clean)"
+fi
+
+# 2) + 3) HTTP through xray's loopback SOCKS inbounds
+http_probe() { # name socks
+  local name="$1" socks="$2" errf out rc code t ok
+  errf="$(mktemp)"
+  out="$(curl -sS -o /dev/null --max-time "$T" --socks5-hostname "$socks" -w '%{http_code} %{time_total}' "$URL" 2>"$errf")"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    code="${out%% *}"; t="${out##* }"
+    case "$code" in 2*|3*) ok=true ;; *) ok=false ;; esac
+    emit "$name" "$ok" "$(awk -v t="$t" 'BEGIN{printf "%d", t*1000}')" "$code" ""
+  else
+    emit "$name" false 0 "" "curl rc=$rc $(clean <"$errf")"
+  fi
+  rm -f "$errf"
+}
+http_probe chain_http  "$SOCKS_CHAIN"
+http_probe direct_http "$SOCKS_DIRECT"
+
+# 4) the bridge's own Reality dest (client-leg health, independent of the Exit). Resolve it the way
+#    xray does — through its first DNS server — so this sees the same CDN edges xray dials.
+dest_target="$DEST"; dest_host="${DEST%%:*}"; dest_port="${DEST##*:}"
+if [ -n "$DEST_RESOLVER" ]; then
+  ip="$(dig +short +time=3 +tries=1 "@$DEST_RESOLVER" "$dest_host" A 2>/dev/null | grep -E '^[0-9.]+$' | head -n1)"
+  [ -n "$ip" ] && dest_target="$ip:$dest_port"
+fi
+s=$(ms_now)
+out="$(timeout "$T" openssl s_client -connect "$dest_target" -servername "$DEST_SNI" -brief </dev/null 2>&1)"
+if grep -q "CONNECTION ESTABLISHED" <<<"$out"; then
+  emit dest_tls true "$(( $(ms_now) - s ))" "" ""
+else
+  emit dest_tls false "$(( $(ms_now) - s ))" "" "$(tail -n1 <<<"$out" | clean)"
+fi
