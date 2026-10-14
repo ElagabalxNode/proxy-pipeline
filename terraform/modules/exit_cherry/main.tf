@@ -57,9 +57,17 @@ locals {
       exit 1
     fi
 
+    # Pinned release, verified before anything is unpacked: never "latest". A download error or
+    # a checksum mismatch (including another architecture's archive) stops here, so the ready
+    # marker below is not written and configure never starts on an unverified panel.
+    XUI_VERSION="${var.xui_version}"
+    XUI_SHA256="${var.xui_archive_sha256}"
     TMP_DIR=$(mktemp -d)
     trap 'rm -rf "$${TMP_DIR}"' EXIT
-    wget -q -O "$${TMP_DIR}/x-ui.tar.gz" "https://github.com/MHSanaei/3x-ui/releases/latest/download/x-ui-linux-$${XUI_ARCH}.tar.gz"
+    curl --fail --silent --show-error --location --retry 3 --max-time 300 \
+      --output "$${TMP_DIR}/x-ui.tar.gz" \
+      "https://github.com/MHSanaei/3x-ui/releases/download/$${XUI_VERSION}/x-ui-linux-$${XUI_ARCH}.tar.gz"
+    printf '%s  %s\n' "$${XUI_SHA256}" "$${TMP_DIR}/x-ui.tar.gz" | sha256sum --check --status
     tar -xzf "$${TMP_DIR}/x-ui.tar.gz" -C "$${TMP_DIR}"
     chmod +x "$${TMP_DIR}/x-ui/x-ui" "$${TMP_DIR}"/x-ui/bin/xray-linux-* "$${TMP_DIR}/x-ui/x-ui.sh"
     install -m 0755 "$${TMP_DIR}/x-ui/x-ui.sh" /usr/bin/x-ui
@@ -80,6 +88,7 @@ locals {
     systemctl restart x-ui
 
     mkdir -p /opt/proxy-pipeline
+    printf '%s %s\n' "$${XUI_VERSION}" "$${XUI_SHA256}" > /opt/proxy-pipeline/x-ui-release
     echo "ready $(date '+%Y-%m-%d %H:%M:%S')" > /opt/proxy-pipeline/.status
   SCRIPT
 }
@@ -100,7 +109,9 @@ resource "cherryservers_server" "exit" {
   }
 
   lifecycle {
-    ignore_changes = [hostname]
+    # user_data only matters at creation. Ignoring later edits (such as a new 3X-UI pin) keeps a
+    # plain apply from replacing the live Exit; the pin takes effect on the next rotation.
+    ignore_changes = [hostname, user_data]
     # Create the replacement first, destroy the old Exit only once it exists: an out-of-stock
     # region (Cherry API 400 "Server is out of stock", 2026-09-08) must not leave the chain
     # without an Exit.

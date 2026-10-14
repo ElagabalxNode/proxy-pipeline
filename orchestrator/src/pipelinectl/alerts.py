@@ -2,7 +2,7 @@
 VPN: e-mail and SMS (sms.ru). Telegram is sent too when configured, but it is not the lifeline.
 
 Source of truth is the bridge chain-probe log mirrored into state/probe/ (one round a minute):
-  DOWN     the last `fail_rounds` rounds all failed chain_http (or tls_exit)
+  DOWN     the last `fail_rounds` rounds all failed chain_http (or entry_https)
   STALE    no round for `stale_minutes` — probe, pull timer or the bridge itself is gone
   RECOVER  a healthy round after a DOWN/STALE alert
 State (what was last announced) lives in state/alert_state.json so each transition is sent once.
@@ -54,12 +54,16 @@ def evaluate(
             f"last probe round {times[-1]:%Y-%m-%d %H:%M}Z — probe, pull timer or bridge down",
             times[-1],
         )
+    # entry_https: clients cannot reach the bridge at all, which is as much an outage as a dead
+    # chain. Its verdict names the bridge, so the watchdog alerts without rotating the Exit.
+    # tls_exit alone is not an outage: the bare handshake probe fails while traffic still flows.
+    outage = {"chain_http", "entry_https"}
     recent = times[-fail_rounds:]
-    if len(recent) == fail_rounds and all({"chain_http", "tls_exit"} & rounds[t] for t in recent):
+    if len(recent) == fail_rounds and all(outage & rounds[t] for t in recent):
         # walk back to the start of the failing streak
         start = recent[0]
         for t in reversed(times[:-fail_rounds]):
-            if {"chain_http", "tls_exit"} & rounds[t]:
+            if outage & rounds[t]:
                 start = t
             else:
                 break

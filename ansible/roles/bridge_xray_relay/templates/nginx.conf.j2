@@ -1,0 +1,114 @@
+# proxy-pipeline managed: HTTPS entry of the bridge. Rewritten by Ansible; do not edit.
+user {{ bridge_https_user }};
+worker_processes auto;
+pid {{ bridge_https_pid }};
+error_log {{ bridge_https_log_dir }}/error.log warn;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include {{ bridge_https_mime_types }};
+    default_type application/octet-stream;
+    server_tokens off;
+    # No access log: it would keep client addresses and the secret path on disk.
+    access_log off;
+    sendfile on;
+    keepalive_timeout 75s;
+    client_body_temp_path {{ bridge_https_temp_dir }}/body;
+    proxy_temp_path {{ bridge_https_temp_dir }}/proxy;
+    fastcgi_temp_path {{ bridge_https_temp_dir }}/fastcgi;
+    uwsgi_temp_path {{ bridge_https_temp_dir }}/uwsgi;
+    scgi_temp_path {{ bridge_https_temp_dir }}/scgi;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:bridge:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # Anything that does not ask for the bridge by name (address scanners, stray names) gets a
+    # throwaway certificate and a dropped connection, so the address does not reveal the name.
+    server {
+        listen {{ bridge_https_port | int }} ssl http2 default_server;
+        server_name _;
+        ssl_certificate {{ bridge_https_dir }}/default.crt;
+        ssl_certificate_key {{ bridge_https_dir }}/default.key;
+        return 444;
+    }
+
+    server {
+        listen {{ bridge_https_port | int }} ssl http2;
+        server_name {{ bridge_https_domain }};
+        ssl_certificate {{ bridge_https_dir }}/fullchain.pem;
+        ssl_certificate_key {{ bridge_https_dir }}/privkey.pem;
+        root {{ bridge_https_webroot }};
+        index index.html;
+
+        # The only way to Xray. XHTTP is a tunnel carried in HTTP requests: buffering a request
+        # body or a response would hold its data back until the request ends.
+        location ^~ {{ bridge_xhttp_path }}/ {
+{% if bridge_xhttp_mode == 'packet-up' %}
+            # packet-up only: the upload is a series of bounded POSTs, relayed over HTTP/1.1.
+            proxy_pass http://127.0.0.1:{{ bridge_xhttp_port | int }};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header Connection "";
+            proxy_set_header X-Forwarded-For $remote_addr;
+            proxy_redirect off;
+            proxy_cache off;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_read_timeout {{ bridge_https_timeout | int }}s;
+            proxy_send_timeout {{ bridge_https_timeout | int }}s;
+            client_max_body_size {{ bridge_https_body_size }};
+{% else %}
+            # auto / stream-up: a stream upload keeps one request open for its whole life, so it
+            # needs HTTP/2 all the way to Xray and no body limit; plain proxy_pass cannot carry
+            # it. The same relay also carries packet-up requests, whichever mode a client picks.
+            grpc_pass grpc://127.0.0.1:{{ bridge_xhttp_port | int }};
+            grpc_set_header Host $host;
+            grpc_set_header X-Forwarded-For $remote_addr;
+            grpc_read_timeout {{ bridge_https_timeout | int }}s;
+            grpc_send_timeout {{ bridge_https_timeout | int }}s;
+            client_max_body_size 0;
+{% endif %}
+            client_body_timeout {{ bridge_https_timeout | int }}s;
+            send_timeout {{ bridge_https_timeout | int }}s;
+        }
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    }
+{% if bridge_https_site_names %}
+
+    # The plain site of the domain itself: the same page, and no way into the tunnel.
+    server {
+        listen {{ bridge_https_port | int }} ssl http2;
+        server_name {{ bridge_https_site_names | join(' ') }};
+        ssl_certificate {{ bridge_https_dir }}/fullchain.pem;
+        ssl_certificate_key {{ bridge_https_dir }}/privkey.pem;
+        root {{ bridge_https_webroot }};
+        index index.html;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    }
+{% endif %}
+{% if bridge_https_http_port | int > 0 %}
+
+    server {
+        listen {{ bridge_https_http_port | int }} default_server;
+        server_name _;
+        return 444;
+    }
+
+    server {
+        listen {{ bridge_https_http_port | int }};
+        server_name {{ ([bridge_https_domain] + bridge_https_site_names) | join(' ') }};
+        return 301 https://$host$request_uri;
+    }
+{% endif %}
+}

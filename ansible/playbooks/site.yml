@@ -2,6 +2,16 @@
 # Full chain: Exit (3X-UI + inbounds) then Bridge (xray-core).
 # pipelinectl writes inventory/hosts.ini (must include [bridge] when Yandex bridge exists).
 
+# A WORLD change that RU must follow (new Exit, new chain identity) leaves the chain down until
+# the Bridge play has run, so an unreachable RU stops the run before WORLD is touched.
+- name: Check that the Bridge is reachable before changing the Exit
+  hosts: bridge
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
 - name: Configure Exit node
   hosts: exit
   gather_facts: false

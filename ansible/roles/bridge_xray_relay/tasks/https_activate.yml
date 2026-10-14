@@ -1,0 +1,32 @@
+---
+# Runs inside the apply.yml transaction, after Xray has released the public port.
+- name: Record the HTTPS activation attempt
+  ansible.builtin.set_fact:
+    bridge_https_activation_attempted: true
+
+- name: Start nginx, or reload it when the certificate or configuration changed
+  ansible.builtin.command:
+    argv: ["{{ bridge_systemctl }}", reload-or-restart, nginx.service]
+  when: >-
+    bridge_https_previous_active.stdout != 'active' or bridge_https_conf_result is changed
+    or bridge_https_files is changed
+
+- name: Keep nginx across reboots
+  ansible.builtin.command:
+    argv: ["{{ bridge_systemctl }}", enable, nginx.service]
+  changed_when: false
+
+- name: Wait for the HTTPS listener
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ bridge_https_port | int }}"
+    timeout: "{{ bridge_start_timeout }}"
+
+# Verified the way a client would: chain and name must validate, the page must be served, and a
+# request that does not know the name must not be shown the bridge's certificate.
+- name: Verify the certificate, the page and the answer to unknown names
+  ansible.builtin.command:
+    argv: [python3, "{{ bridge_support_path }}", check-https]
+    stdin: "{{ {'name': item, 'port': bridge_https_port | int, 'ca_file': bridge_https_ca_file} | to_json }}"
+  loop: "{{ [bridge_https_domain] + bridge_https_site_names }}"
+  changed_when: false

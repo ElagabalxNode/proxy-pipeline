@@ -1,0 +1,186 @@
+---
+- name: Require an explicit Xray release pin
+  ansible.builtin.assert:
+    that:
+      - bridge_xray_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - bridge_xray_archive_sha256 is match('^[0-9a-f]{64}$')
+      - bridge_xray_archive_path == '' or bridge_xray_archive_path.startswith('/')
+    fail_msg: "Pin bridge_xray_version and the architecture-specific archive SHA256; latest/automatic upgrades are disabled"
+
+- name: Detect Bridge architecture
+  ansible.builtin.command: uname -m
+  register: bridge_arch
+  changed_when: false
+
+- name: Require a supported release architecture
+  ansible.builtin.assert:
+    that: bridge_arch.stdout in ['x86_64', 'aarch64']
+    fail_msg: "Only official linux-64 and linux-arm64-v8a archives are supported"
+
+- name: Create private controller artifact cache
+  ansible.builtin.file:
+    path: "{{ pipeline_state_dir }}/artifacts"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: Choose controller artifact path
+  ansible.builtin.set_fact:
+    bridge_archive_local: "{{ bridge_xray_archive_path or (pipeline_state_dir ~ '/artifacts/' ~ bridge_xray_archive_sha256 ~ '.zip') }}"
+
+- name: Download pinned Xray on the controller
+  ansible.builtin.get_url:
+    url: "https://github.com/XTLS/Xray-core/releases/download/v{{ bridge_xray_version }}/Xray-linux-{{ '64' if bridge_arch.stdout == 'x86_64' else 'arm64-v8a' }}.zip"
+    dest: "{{ bridge_archive_local }}"
+    checksum: "sha256:{{ bridge_xray_archive_sha256 }}"
+    mode: "0600"
+    timeout: 60
+  delegate_to: localhost
+  become: false
+  when: bridge_xray_archive_path == ''
+
+- name: Check controller archive including offline delivery
+  ansible.builtin.stat:
+    path: "{{ bridge_archive_local }}"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  become: false
+  register: bridge_archive_stat
+
+- name: Refuse a missing or mismatched controller artifact
+  ansible.builtin.assert:
+    that:
+      - bridge_archive_stat.stat.isreg | default(false)
+      - bridge_archive_stat.stat.checksum | default('') == bridge_xray_archive_sha256
+    fail_msg: "Xray archive missing or SHA256 mismatch; nothing installed on RU"
+
+- name: Create Bridge preparation directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ bridge_xray_cache_dir }}"
+    - "{{ bridge_support_path | dirname }}"
+    - "{{ bridge_xray_config | dirname }}"
+    - "{{ bridge_xray_binary | dirname }}"
+    - "{{ bridge_xray_asset_dir }}"
+    - "{{ bridge_xray_log_dir }}"
+
+- name: Install Bridge preparation helper
+  ansible.builtin.copy:
+    src: bridge_support.py
+    dest: "{{ bridge_support_path }}"
+    mode: "0644"
+
+- name: Deliver checked archive to Bridge over SSH
+  ansible.builtin.copy:
+    src: "{{ bridge_archive_local }}"
+    dest: "{{ bridge_xray_cache_dir }}/{{ bridge_xray_archive_sha256 }}.zip"
+    mode: "0600"
+
+- name: Verify archive, binary version and extracted files before installation
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ bridge_support_path }}"
+      - prepare
+      - --archive
+      - "{{ bridge_xray_cache_dir }}/{{ bridge_xray_archive_sha256 }}.zip"
+      - --checksum
+      - "{{ bridge_xray_archive_sha256 }}"
+      - --version
+      - "{{ bridge_xray_version }}"
+      - --cache
+      - "{{ bridge_xray_cache_dir }}"
+  register: bridge_prepared_raw
+  changed_when: (bridge_prepared_raw.stdout | from_json).changed
+
+- name: Record verified artifact
+  ansible.builtin.set_fact:
+    bridge_prepared: "{{ bridge_prepared_raw.stdout | from_json }}"
+
+- name: Inspect existing Bridge binary
+  ansible.builtin.stat:
+    path: "{{ bridge_xray_binary }}"
+    checksum_algorithm: sha256
+  register: bridge_binary_stat
+
+- name: Refuse implicit binary replacement or upgrade
+  ansible.builtin.assert:
+    that:
+      - not bridge_binary_stat.stat.exists or (bridge_binary_stat.stat.isreg | default(false) and bridge_binary_stat.stat.checksum | default('') == bridge_prepared.hashes.xray)
+    fail_msg: "Installed Xray differs from the pinned artifact; inventory its version/hash and plan an explicit upgrade before configuring"
+
+- name: Install verified binary only on a fresh Bridge
+  ansible.builtin.copy:
+    src: "{{ bridge_prepared.directory }}/xray"
+    remote_src: true
+    dest: "{{ bridge_xray_binary }}"
+    mode: "0755"
+    force: false
+
+- name: Confirm installed binary hash
+  ansible.builtin.stat:
+    path: "{{ bridge_xray_binary }}"
+    checksum_algorithm: sha256
+  register: bridge_installed_stat
+
+- name: Require the installed binary to match the artifact
+  ansible.builtin.assert:
+    that: bridge_installed_stat.stat.checksum == bridge_prepared.hashes.xray
+
+- name: Install missing geodata without replacing existing operator data
+  ansible.builtin.copy:
+    src: "{{ bridge_prepared.directory }}/{{ item }}"
+    remote_src: true
+    dest: "{{ bridge_xray_asset_dir }}/{{ item }}"
+    mode: "0644"
+    force: false
+  loop: [geoip.dat, geosite.dat]
+
+- name: Inspect existing Xray unit
+  ansible.builtin.command:
+    argv: ["{{ bridge_systemctl }}", show, xray.service, --property=LoadState, --value]
+  register: bridge_unit_load
+  changed_when: false
+  failed_when: >-
+    bridge_unit_load.stdout not in ['loaded', 'not-found'] or
+    (bridge_unit_load.rc != 0 and bridge_unit_load.stdout != 'not-found')
+
+- name: Install service unit only on a fresh Bridge
+  ansible.builtin.template:
+    src: xray.service.j2
+    dest: "{{ bridge_xray_unit_path }}"
+    mode: "0644"
+  when: bridge_unit_load.stdout == 'not-found'
+  register: bridge_unit_install
+
+- name: Create logs for a newly installed unit
+  ansible.builtin.copy:
+    content: ""
+    dest: "{{ bridge_xray_log_dir }}/{{ item }}.log"
+    owner: "{{ bridge_xray_service_user }}"
+    mode: "0600"
+    force: false
+  loop: [access, error]
+  when: bridge_unit_load.stdout == 'not-found'
+
+- name: Reload newly installed service unit
+  ansible.builtin.command:
+    argv: ["{{ bridge_systemctl }}", daemon-reload]
+  when: bridge_unit_install is changed
+
+- name: Inspect effective Xray command
+  ansible.builtin.command:
+    argv: ["{{ bridge_systemctl }}", show, xray.service, --property=ExecStart, --value]
+  register: bridge_unit_exec
+  changed_when: false
+
+- name: Require the supported service command before modifying config
+  ansible.builtin.assert:
+    that:
+      - "('path=' ~ bridge_xray_binary ~ ' ;') in bridge_unit_exec.stdout"
+      - "('argv[]=' ~ bridge_xray_binary ~ ' run -config ' ~ bridge_xray_config ~ ' ;') in bridge_unit_exec.stdout"
+    fail_msg: "Existing xray.service uses an unsupported binary/config/command; inspect its unit and drop-ins before configuring"

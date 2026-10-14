@@ -18,6 +18,8 @@ module "exit" {
   exit_plan           = var.exit_plan
   exit_image          = var.exit_image
   ssh_public_key_path = var.ssh_public_key_path
+  xui_version         = var.xui_version
+  xui_archive_sha256  = var.xui_archive_sha256
   panel_port          = var.panel_port
   panel_user          = var.panel_user
   panel_pass          = var.panel_pass

@@ -7,5 +7,9 @@
   "sni": "{{ bridge_reality_sni }}",
   "dest": "{{ bridge_reality_dest }}",
   "ss_method": "{{ bridge_ss_method }}",
+{% if bridge_xhttp_enabled %}
+  "xhttp_uuid": "{{ bridge_xhttp_uuid }}",
+  "xhttp_path": "{{ bridge_xhttp_path }}",
+{% endif %}
   "ss_password": "{{ bridge_ss_password }}"
 }

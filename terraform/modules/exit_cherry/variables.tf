@@ -26,6 +26,14 @@ variable "ssh_public_key_path" {
   type = string
 }
 
+variable "xui_version" {
+  type = string
+}
+
+variable "xui_archive_sha256" {
+  type = string
+}
+
 variable "panel_port" {
   type = string
 }

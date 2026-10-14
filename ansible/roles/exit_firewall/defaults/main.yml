@@ -1,19 +1,29 @@
-# The Exit exposes NOTHING to the internet. Clients always come through the bridge, automation
-# always comes from the controller, so every service is allow-listed to those two addresses:
-#   client ports (Reality 443, SS 8388, chain 8443)  <- bridge + controller
-#   admin ports  (SSH 22, 3X-UI panel 2053)          <- controller (+ exit_fw_extra_admin_cidrs)
+# WORLD firewall with separate chain and direct policies:
+#   chain port (8443)                    <- bridge + controller, always
+#   direct ports (Reality 443, SS 8388)  <- bridge + controller, plus exit_fw_direct_policy:
+#       public    = any source            allowlist = exit_fw_direct_cidrs
+#       closed    = nobody else (clients reach WORLD only through the bridge)
+#   SSH                                  <- controller + exit_fw_extra_admin_cidrs (+ bridge check)
+#   3X-UI panel                          <- nobody: configure and validate use SSH to loopback;
+#                                           for the UI run `ssh -L 2053:127.0.0.1:2053 root@<exit>`
 # 2026-09-12: the plain-HTTP panel and the proxy ports on a public IP were a Shodan/Netcraft
-# beacon ("VPN here") and an attack surface; the owner never uses the panel UI.
-exit_fw_bridge_ip: ""                     # set by pipelinectl configure (bridge_public_ip)
-exit_fw_extra_admin_cidrs: []            # e.g. ["203.0.113.5/32"] — your own IP for SSH/panel
+# beacon ("VPN here") and an attack surface. The direct policy is therefore a deliberate choice
+# with NO default: pipelinectl passes firewall.direct_policy, and the role refuses without it.
+exit_fw_action: apply                    # apply | rollback (restore exit_fw_snapshot)
+exit_fw_snapshot: latest                 # rollback target: latest or a snapshot name
+exit_fw_bridge_ip: ""                    # set by pipelinectl configure (bridge_public_ip)
+exit_fw_direct_only: false               # explicit no-bridge mode; an empty bridge IP alone is refused
+exit_fw_direct_policy: ""                # public | allowlist | closed
+exit_fw_direct_cidrs: []                 # allowlist sources, IPv4 and/or IPv6
+exit_fw_extra_admin_cidrs: []            # e.g. ["203.0.113.5/32"] — your own IP for SSH
 exit_fw_ssh_world: false                 # true = keep SSH open to the world (key-only anyway)
-exit_fw_client_ports:
-  - "{{ reality_port | default(443) }}"
-  - "{{ ss_port | default(8388) }}"
-  - "{{ chain_port | default(8443) }}"
-exit_fw_admin_ports:
-  - "22"
-  - "{{ panel_port | default('2053') }}"
-# Lockout guard: `ufw disable` is scheduled before enabling; cancelled only after a FRESH SSH
-# session from the controller succeeds through the new rules.
+exit_fw_ssh_port: "{{ ansible_port | default(22) }}"
+# Lockout guard: restoring the pre-change snapshot is scheduled before any change; cancelled only
+# after a FRESH SSH session from the controller succeeds through the new rules.
 exit_fw_safety_seconds: 300
+exit_fw_fresh_ssh_delay: 5
+exit_fw_remote_helper: /usr/local/libexec/proxy-pipeline/firewall_remote.py
+exit_fw_state_dir: /var/lib/proxy-pipeline/exit-firewall
+exit_fw_python: /usr/bin/python3
+exit_fw_root: /
+exit_fw_install_package: true

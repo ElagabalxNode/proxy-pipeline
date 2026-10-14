@@ -42,6 +42,14 @@ def test_down_after_three_failing_rounds_with_streak_start() -> None:
     assert v.since == T0 + timedelta(minutes=5)  # first failing round, not just the last 3
 
 
+def test_hop_handshake_failures_alone_are_not_an_outage() -> None:
+    records = _recs(5, 4)
+    for record in records:
+        if record["check"] == "chain_http":
+            record["ok"] = True
+    assert alerts.evaluate(records, T0 + timedelta(minutes=9)).status == "ok"
+
+
 def test_two_failing_rounds_is_not_yet_down() -> None:
     assert alerts.evaluate(_recs(5, 2), T0 + timedelta(minutes=7)).status == "ok"
 

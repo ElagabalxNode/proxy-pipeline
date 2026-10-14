@@ -13,6 +13,12 @@ exit_image        = "ubuntu_24_04_64bit"
 
 ssh_public_key_path = "~/.ssh/proxy_pipeline.pub"
 
+# 3X-UI installed on a NEW Exit: exact release tag + SHA256 of x-ui-linux-amd64.tar.gz.
+# Required. Must agree with xray.world_release in config/pipeline.yaml; check both with
+# `pipelinectl world-release --verify` (rotate does this before replacing the Exit).
+xui_version        = ""
+xui_archive_sha256 = ""
+
 # --- Bridge: Timeweb Cloud (RU, cheap) ---
 enable_timeweb_bridge         = true
 timeweb_configurator_location = "ru-2"  # ru-1=СПб, ru-2=Москва, de-1, kz-1

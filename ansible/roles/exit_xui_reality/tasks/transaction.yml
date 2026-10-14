@@ -1,0 +1,51 @@
+---
+- name: Capture WORLD connection and configuration before delegation
+  ansible.builtin.set_fact:
+    world_options:
+      state_dir: "{{ pipeline_state_dir }}"
+      exit_ip: "{{ ansible_host }}"
+      ssh_user: "{{ ansible_user }}"
+      ssh_key: "{{ ansible_ssh_private_key_file }}"
+      become: "{{ ansible_become | default(true) | bool }}"
+      remote_helper: "{{ world_remote_helper }}"
+      binary: "{{ world_binary }}"
+      panel_port: "{{ panel_port | int }}"
+      panel_path: "{{ panel_request_prefix }}"
+      panel_user: "{{ panel_user }}"
+      panel_pass: "{{ panel_pass }}"
+      reality_sni: "{{ reality_sni }}"
+      reality_dest: "{{ reality_dest }}"
+      reality_port: "{{ reality_port | int }}"
+      ss_port: "{{ ss_port | int }}"
+      ss_method: "{{ ss_method }}"
+      chain_port: "{{ chain_port | int }}"
+      separate_chain: "{{ world_separate_chain | bool }}"
+      chain_reality_sni: "{{ chain_reality_sni }}"
+      chain_reality_dest: "{{ chain_reality_dest }}"
+      xui_version: "{{ world_xui_version }}"
+      xray_sha256: "{{ world_xray_sha256 }}"
+  no_log: true
+
+- name: Apply managed WORLD inbounds and runtime transactionally
+  ansible.builtin.command:
+    argv: ["{{ ansible_playbook_python }}", "{{ role_path }}/files/world_support.py"]
+    stdin: "{{ world_options | to_json }}"
+  environment:
+    PYTHONPATH: "{{ role_path }}/../bridge_xray_relay/files"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: world_transaction
+  failed_when: false
+  changed_when: world_transaction.rc == 0 and (world_transaction.stdout | from_json).changed
+  # Helper prints only fixed status/errors, but Ansible command args contain credentials.
+  no_log: true
+
+- name: Require a successful WORLD transaction
+  ansible.builtin.assert:
+    that: world_transaction.rc == 0
+    fail_msg: "{{ world_transaction.stderr | default('WORLD helper failed') | truncate(400) }}"
+
+- name: Report WORLD transaction result
+  ansible.builtin.debug:
+    msg: "{{ world_transaction.stdout | from_json }}"

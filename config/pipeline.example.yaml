@@ -42,6 +42,10 @@ panel:
   # Set via env PROXY_PIPELINE_PANEL_PASS or pipeline.yaml (not recommended in git)
   pass: ""
   path: /secretpanel
+  # One-time only for an EMPTY fresh SQLite panel, then set back to false.
+  # Existing panels must authenticate with the credentials/path above; configure
+  # no longer resets their settings or restarts x-ui on every run.
+  bootstrap: false
 
 xray:
   reality_sni: www.microsoft.com
@@ -49,6 +53,81 @@ xray:
   ss_port: 8388
   ss_method: 2022-blake3-aes-128-gcm
   chain_port: 8443
+  # Optional client-facing RU port, independent of --chain-mode / PROXY_PIPELINE_CHAIN_MODE.
+  # Unset: retain provider defaults (Timeweb=8443, Yandex/manual=443).
+  # bridge_reality_port: 443
+  # Required before configuring WORLD. configure compares the node with this pin before the
+  # panel bootstrap or any API change and refuses a different 3X-UI/Xray build; nothing is
+  # upgraded automatically. Read the installed values with `pipelinectl inventory`; for a new
+  # release compute them with `pipelinectl world-release --archive x-ui-linux-amd64.tar.gz`.
+  # xui_version must equal xui_version in terraform.tfvars (what a NEW Exit installs).
+  world_release:
+    xui_version: ""        # 3X-UI, x.y.z
+    xray_version: ""       # bundled Xray, x.y.z
+    xray_sha256: ""        # SHA256 of /usr/local/x-ui/bin/xray-linux-<arch>
+  # Required before configuring RU. Pin the approved version and SHA256 of its official
+  # Xray-linux-64.zip (x86_64) or Xray-linux-arm64-v8a.zip (aarch64), independently of WORLD.
+  # Existing binaries must match this artifact; automatic upgrades are refused.
+  bridge_release:
+    version: ""
+    archive_sha256: ""
+    # Optional absolute controller path to the ZIP (offline delivery); otherwise fetched
+    # on the controller from the official release, then copied to RU over SSH.
+    archive_path: ""
+
+# RU bridge on a server you create yourself (any RU VPS, e.g. VDSina): Ubuntu 22.04/24.04 with the
+# controller's SSH key for ssh_user. configure, rotate and the Exit firewall use this address unless
+# --bridge-ip is given; `pipelinectl rotate bridge --bridge-ip NEW` rewrites ip after a move.
+# Empty ip = the bridge comes from Terraform (Yandex) or there is none.
+bridge_manual:
+  ip: ""
+  ssh_user: root
+  provider: ""               # label for `pipelinectl status`, e.g. VDSina
+
+# HTTPS entry of the bridge: nginx on RU:443 with your own name and certificate, the VLESS +
+# XHTTP client entry behind it on loopback. Empty domain = off, the bridge works as before.
+bridge_entry:
+  domain: ""                 # e.g. lk.example.ru; must resolve to the bridge address (A record only)
+  zone: ""                   # DNS zone of that name; empty = the domain without its first label
+  # Empty = the wildcard certificate that `pipelinectl cert issue` publishes in
+  # state/certs/<zone>/. Set both only to deliver a certificate obtained some other way.
+  certificate: ""            # absolute controller path: certificate with its chain (PEM)
+  private_key: ""            # absolute controller path: its key
+  # nginx takes 80/443, so the RAW/REALITY inbound moves here (a temporary reserve profile).
+  legacy_reality_port: 8443
+  # What the server accepts: auto (default, every XHTTP mode: client apps choose their own and
+  # may ignore the link), stream-up, or packet-up (only for a path through a buffering CDN).
+  xhttp_mode: auto
+  site_dir: ""               # optional directory with a static site; empty = built-in page
+  # Other names of the zone that show only that page, e.g. [example.ru, www.example.ru]: the
+  # bare domain then is an ordinary site instead of a name that does not resolve.
+  site_names: []
+
+# Certificate of the HTTPS entry: Let's Encrypt wildcard for the zone, DNS-01 challenge, run on the
+# controller by a pinned lego (`pipelinectl cert issue|renew|status`). The DNS API token is read
+# from TIMEWEBCLOUD_AUTH_TOKEN, else TWC_TOKEN (environment or .env) and needs DNS access.
+acme:
+  dns_provider: timewebcloud
+  email: ""                  # optional contact for the ACME account
+  lego_release:              # required for cert issue/renew; official lego_v<version>_linux_<arch>.tar.gz
+    version: ""
+    archive_sha256: ""
+
+# WORLD firewall (role exit_firewall). The chain port is always limited to the bridge and the
+# controller; the 3X-UI panel port is never opened (API and UI go through SSH to loopback).
+firewall:
+  # REQUIRED, no default — who may reach the direct ports (Reality + SS2022) besides the
+  # bridge and the controller:
+  #   public    = anyone (direct stays a control/fallback profile for clients)
+  #   allowlist = only direct_cidrs
+  #   closed    = nobody: clients reach WORLD only through the bridge
+  direct_policy: ""
+  direct_cidrs: []         # for allowlist, IPv4 and/or IPv6, e.g. ["203.0.113.0/24"]
+  admin_cidrs: []          # extra SSH sources besides the controller (your own address)
+  ssh_world: false         # true = SSH open to the world (key-only)
+  # WORLD deliberately has no bridge (same as `configure --direct-only`). Without it an empty
+  # bridge IP stops configure, so a manual RU is never locked out of the chain port by mistake.
+  direct_only: false
 
 alerts:
   telegram_bot_token: ""
@@ -69,7 +148,7 @@ alerts:
 # chain DOWN because of the Exit -> `rotate exit --yes` in the same region (all gates + re-rolls),
 # then each fallback region; alert only if every attempt failed. Rails against loops:
 watchdog:
-  auto_rotate: true
+  auto_rotate: false       # true = replace a dead Exit automatically (Cherry charges for it)
   cooldown_hours: 2        # min time between automatic rotations
   max_per_day: 3           # hard cap per 24 h, then alert only
   fallback_regions: []     # e.g. ["LT-Siauliai", "DE-Frankfurt"] tried after the same region

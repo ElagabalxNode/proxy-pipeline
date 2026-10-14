@@ -4,7 +4,7 @@
 # The controller mirrors the log directory into state/probe/ and `pipelinectl chainlog` reads it.
 #
 #   tls_exit     TLS handshake to the Exit's chain inbound {{ exit_state.exit_ip }}:{{ exit_state.chain_port }}
-#                (SNI {{ exit_state.reality_sni }}): the bridge->Exit hop alone — the leg that crosses the RU border.
+#                (SNI {{ exit_state.chain_reality_sni | default(exit_state.reality_sni) }}): the bridge->Exit hop alone — the leg that crosses the RU border.
 #   chain_http   GET {{ chain_probe_url }} through xray's loopback SOCKS `probe-in`
 #                -> chain-to-exit -> Exit -> internet: the whole chain minus the client leg.
 #   direct_http  the same GET through `probe-direct-in`, routed to `direct`: the bridge's own egress,
@@ -12,10 +12,15 @@
 #   dest_tls     TLS handshake to the bridge's OWN Reality dest ({{ bridge_reality_dest }}, SNI
 #                {{ bridge_reality_sni }}). xray dials it on every client handshake: if it is slow or
 #                dead from here, every client sees "-1" / minute-long connects even with a healthy chain.
+{% if bridge_https_domain %}
+#   entry_https  HTTPS to the bridge's own name ({{ bridge_https_domain }}) on loopback, verified like a
+#                client would: certificate chain, name and the page. The main client entry.
+#   entry_cert   that certificate still has more than {{ chain_probe_cert_days }} days left.
+{% endif %}
 set -u
 DEST="{{ bridge_reality_dest }}"; DEST_SNI="{{ bridge_reality_sni }}"; DEST_RESOLVER="{{ bridge_dest_resolver | default('', true) }}"
 LOG="{{ chain_probe_log }}"
-EXIT_IP="{{ exit_state.exit_ip }}"; CHAIN_PORT="{{ exit_state.chain_port }}"; SNI="{{ exit_state.reality_sni }}"
+EXIT_IP="{{ exit_state.exit_ip }}"; CHAIN_PORT="{{ exit_state.chain_port }}"; SNI="{{ exit_state.chain_reality_sni | default(exit_state.reality_sni) }}"
 URL="{{ chain_probe_url }}"
 SOCKS_CHAIN="127.0.0.1:{{ chain_probe_socks_port }}"; SOCKS_DIRECT="127.0.0.1:{{ chain_probe_direct_port }}"
 T="{{ chain_probe_timeout }}"
@@ -69,3 +74,25 @@ if grep -q "CONNECTION ESTABLISHED" <<<"$out"; then
 else
   emit dest_tls false "$(( $(ms_now) - s ))" "" "$(tail -n1 <<<"$out" | clean)"
 fi
+{% if bridge_https_domain %}
+
+# 5) the HTTPS entry clients use. --resolve keeps the name and certificate check real while the
+#    request stays on this host, so the result does not depend on DNS or on the bridge's egress.
+ENTRY="{{ bridge_https_domain }}"; ENTRY_PORT="{{ bridge_https_port | int }}"
+ENTRY_CERT="{{ bridge_https_dir }}/fullchain.pem"; CERT_DAYS="{{ chain_probe_cert_days | int }}"
+errf="$(mktemp)"
+s=$(ms_now)
+code="$(curl -sS -o /dev/null --max-time "$T" --resolve "$ENTRY:$ENTRY_PORT:127.0.0.1" -w '%{http_code}' "https://$ENTRY:$ENTRY_PORT/" 2>"$errf")"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$code" = "200" ]; then
+  emit entry_https true "$(( $(ms_now) - s ))" "$code" ""
+else
+  emit entry_https false "$(( $(ms_now) - s ))" "$code" "curl rc=$rc $(clean <"$errf")"
+fi
+rm -f "$errf"
+if openssl x509 -in "$ENTRY_CERT" -noout -checkend "$(( CERT_DAYS * 86400 ))" >/dev/null 2>&1; then
+  emit entry_cert true 0 "" ""
+else
+  emit entry_cert false 0 "" "missing, unreadable or expires within $CERT_DAYS days"
+fi
+{% endif %}

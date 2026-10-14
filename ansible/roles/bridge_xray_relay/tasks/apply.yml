@@ -1,0 +1,275 @@
+---
+# Transaction boundary: config + service state on RU and two controller state files.
+# Installer, resolver/sysctl changes and WORLD are outside this transaction.
+- name: Inspect previous Bridge config
+  ansible.builtin.stat:
+    path: "{{ bridge_xray_config }}"
+  register: bridge_previous_config
+
+- name: Refuse to overwrite a symlink or non-regular config
+  ansible.builtin.assert:
+    that: not bridge_previous_config.stat.exists or bridge_previous_config.stat.isreg | default(false)
+
+- name: Snapshot previous service activity
+  ansible.builtin.command:
+    argv: ["{{ bridge_systemctl }}", is-active, xray.service]
+  register: bridge_previous_active
+  changed_when: false
+  failed_when: bridge_previous_active.stdout not in ['active', 'inactive', 'failed']
+
+- name: Snapshot previous service enablement
+  ansible.builtin.command:
+    argv: ["{{ bridge_systemctl }}", is-enabled, xray.service]
+  register: bridge_previous_enabled
+  changed_when: false
+  failed_when: bridge_previous_enabled.stdout not in ['enabled', 'disabled']
+
+- name: Inspect previous controller state files
+  ansible.builtin.stat:
+    path: "{{ pipeline_state_dir }}/{{ item }}"
+  loop: [bridge_runtime.json, bridge_identity.json]
+  delegate_to: localhost
+  become: false
+  register: bridge_previous_state
+
+- name: Refuse to overwrite non-regular controller state files
+  ansible.builtin.assert:
+    that: not item.stat.exists or item.stat.isreg | default(false)
+  loop: "{{ bridge_previous_state.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Snapshot previous controller state files
+  ansible.builtin.slurp:
+    src: "{{ pipeline_state_dir }}/{{ item.item }}"
+  when: item.stat.exists
+  loop: "{{ bridge_previous_state.results }}"
+  delegate_to: localhost
+  become: false
+  register: bridge_saved_state
+  no_log: true
+
+- name: Reset transaction progress
+  ansible.builtin.set_fact:
+    bridge_activation_attempted: false
+    bridge_enable_attempted: false
+    bridge_state_write_attempted: false
+    bridge_https_activation_attempted: false
+    bridge_https_stopped: false
+
+# nginx and Xray want the same public port in turn, so both directions need the other's state:
+# enabling the HTTPS entry starts nginx only after Xray has moved; disabling it stops nginx
+# before Xray comes back.
+- name: Snapshot previous nginx activity
+  ansible.builtin.command:
+    argv: ["{{ bridge_systemctl }}", is-active, nginx.service]
+  register: bridge_https_previous_active
+  changed_when: false
+  failed_when: false
+
+- name: Tell whether a running nginx is this role's HTTPS entry
+  ansible.builtin.command:
+    argv: [grep, -q, "proxy-pipeline managed", "{{ bridge_https_conf }}"]
+  register: bridge_https_managed
+  changed_when: false
+  failed_when: false
+
+- name: Prepare and validate the HTTPS entry
+  ansible.builtin.include_tasks: https.yml
+  when: bridge_https_domain | length > 0
+
+- name: Apply and verify Bridge configuration before publishing state
+  block:
+    - name: Validate and install candidate Xray config
+      ansible.builtin.template:
+        src: xray.config.json.j2
+        dest: "{{ bridge_xray_config }}"
+        mode: "{{ bridge_previous_config.stat.mode | default('0644') }}"
+        validate: "{{ bridge_xray_binary }} run -test -config %s"
+        backup: true
+      vars:
+        exit_ip: "{{ exit_state.exit_ip }}"
+        chain_port: "{{ exit_state.chain_port }}"
+        chain_uuid: "{{ exit_state.chain_uuid }}"
+        chain_path: "{{ exit_state.chain_path | default('/chain-relay') }}"
+        # The chain inbound's own REALITY identity; a runtime written before the split has
+        # none, and then the chain still shares the direct inbound's parameters.
+        exit_public_key: "{{ exit_state.chain_public_key | default(exit_state.public_key) }}"
+        exit_short_id: "{{ exit_state.chain_short_id | default(exit_state.short_id) }}"
+        exit_reality_sni: "{{ exit_state.chain_reality_sni | default(exit_state.reality_sni) }}"
+        ss_method: "{{ exit_state.ss_method }}"
+        ss_password: "{{ exit_state.ss_password }}"
+        ss_port: "{{ exit_state.ss_port | int }}"
+      environment:
+        XRAY_LOCATION_ASSET: "{{ bridge_xray_asset_dir }}"
+      register: bridge_candidate
+      no_log: true
+      diff: false
+
+    - name: Stop the HTTPS entry before Xray returns to its port
+      ansible.builtin.command:
+        argv: ["{{ bridge_systemctl }}", "{{ item }}", nginx.service]
+      loop: [stop, disable]
+      when:
+        - bridge_https_domain | length == 0
+        - bridge_https_previous_active.stdout == 'active'
+        - bridge_https_managed.rc == 0
+      register: bridge_https_stop
+
+    - name: Remember that nginx was stopped by this run
+      ansible.builtin.set_fact:
+        bridge_https_stopped: true
+      when: bridge_https_stop is changed
+
+    - name: Record service activation attempt
+      ansible.builtin.set_fact:
+        bridge_activation_attempted: true
+      when: bridge_candidate is changed or bridge_previous_active.stdout != 'active'
+
+    - name: Activate candidate without restarting an unchanged active service
+      ansible.builtin.command:
+        argv: ["{{ bridge_systemctl }}", "{{ 'restart' if bridge_candidate is changed else 'start' }}", xray.service]
+      when: bridge_activation_attempted
+
+    - name: Wait for the client VLESS listener
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ bridge_reality_port | default(443) | int }}"
+        timeout: "{{ bridge_start_timeout }}"
+
+    - name: Wait for the loopback XHTTP entry
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ bridge_xhttp_port | int }}"
+        timeout: "{{ bridge_start_timeout }}"
+      when: bridge_xhttp_enabled
+
+    - name: Activate the HTTPS entry
+      ansible.builtin.include_tasks: https_activate.yml
+      when: bridge_https_domain | length > 0
+
+    - name: Require the Xray service to remain active
+      ansible.builtin.command:
+        argv: ["{{ bridge_systemctl }}", is-active, xray.service]
+      register: bridge_activated
+      changed_when: false
+      failed_when: bridge_activated.rc != 0 or bridge_activated.stdout != 'active'
+
+    - name: Record service enablement attempt
+      ansible.builtin.set_fact:
+        bridge_enable_attempted: true
+      when: bridge_previous_enabled.stdout != 'enabled'
+
+    - name: Enable the verified service
+      ansible.builtin.command:
+        argv: ["{{ bridge_systemctl }}", enable, xray.service]
+      when: bridge_previous_enabled.stdout != 'enabled'
+
+    - name: Record controller state write attempt
+      ansible.builtin.set_fact:
+        bridge_state_write_attempted: true
+
+    - name: Publish Bridge runtime and identity on the controller
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "{{ pipeline_state_dir }}/{{ item }}"
+        mode: "0600"
+      loop: [bridge_runtime.json, bridge_identity.json]
+      delegate_to: localhost
+      become: false
+      no_log: true
+      diff: false
+
+  rescue:
+    # nginx first: the previous Xray config may need the port nginx has just taken.
+    - name: Restore previous HTTPS certificate and key
+      ansible.builtin.copy:
+        src: "{{ item.backup_file }}"
+        remote_src: true
+        dest: "{{ item.dest }}"
+        mode: "0600"
+      loop: "{{ bridge_https_files.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name | default('file') }}"
+      when: item is changed and item.backup_file is defined
+      no_log: true
+      diff: false
+
+    - name: Restore previous nginx configuration
+      ansible.builtin.copy:
+        src: "{{ bridge_https_conf_result.backup_file }}"
+        remote_src: true
+        dest: "{{ bridge_https_conf }}"
+        mode: "0644"
+      when: bridge_https_conf_result is defined and bridge_https_conf_result is changed and bridge_https_conf_result.backup_file is defined
+
+    - name: Return nginx to its previous activity
+      ansible.builtin.command:
+        argv: ["{{ bridge_systemctl }}", "{{ 'reload-or-restart' if bridge_https_previous_active.stdout == 'active' else 'stop' }}", nginx.service]
+      when: bridge_https_activation_attempted or bridge_https_stopped
+      register: bridge_rollback_https
+      failed_when: false
+
+    # Byte-exact: the copy module's `content` re-serialises anything that parses as JSON, so the
+    # file the template task saved before replacing the config is copied back instead.
+    - name: Restore previous config after a failed candidate
+      ansible.builtin.copy:
+        src: "{{ bridge_candidate.backup_file }}"
+        remote_src: true
+        dest: "{{ bridge_xray_config }}"
+        mode: "{{ bridge_previous_config.stat.mode }}"
+        owner: "{{ bridge_previous_config.stat.uid }}"
+        group: "{{ bridge_previous_config.stat.gid }}"
+      when: bridge_candidate is changed and bridge_previous_config.stat.exists
+      no_log: true
+      diff: false
+
+    - name: Remove candidate when no config existed
+      ansible.builtin.file:
+        path: "{{ bridge_xray_config }}"
+        state: absent
+      when: bridge_candidate is changed and not bridge_previous_config.stat.exists
+
+    - name: Restore previous service activity
+      ansible.builtin.command:
+        argv: ["{{ bridge_systemctl }}", "{{ 'restart' if bridge_previous_active.stdout == 'active' else 'stop' }}", xray.service]
+      when: bridge_activation_attempted
+      register: bridge_rollback_service
+      failed_when: false
+
+    - name: Restore previous service enablement
+      ansible.builtin.command:
+        argv: ["{{ bridge_systemctl }}", "{{ 'enable' if bridge_previous_enabled.stdout == 'enabled' else 'disable' }}", xray.service]
+      when: bridge_enable_attempted
+      register: bridge_rollback_enabled
+      failed_when: false
+
+    - name: Restore previous controller state files
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ role_path }}/files/bridge_support.py", restore-file]
+        stdin: "{{ {'path': pipeline_state_dir ~ '/' ~ item.item.item, 'content': item.content, 'mode': item.item.stat.mode} | to_json }}"
+      loop: "{{ bridge_saved_state.results }}"
+      when: bridge_state_write_attempted and item.content is defined
+      delegate_to: localhost
+      become: false
+      no_log: true
+      diff: false
+
+    - name: Remove newly created controller state files
+      ansible.builtin.file:
+        path: "{{ pipeline_state_dir }}/{{ item.item }}"
+        state: absent
+      loop: "{{ bridge_previous_state.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: bridge_state_write_attempted and not item.stat.exists
+      delegate_to: localhost
+      become: false
+
+    - name: Report unsuccessful apply even when rollback succeeded
+      ansible.builtin.fail:
+        msg: >-
+          Bridge apply failed; previous config and controller state retained/restored.
+          Service restore rc={{ bridge_rollback_service.rc | default('not needed') }},
+          enablement restore rc={{ bridge_rollback_enabled.rc | default('not needed') }}.
+          Inspect service health before retrying; WORLD and preparation tasks are outside this rollback.

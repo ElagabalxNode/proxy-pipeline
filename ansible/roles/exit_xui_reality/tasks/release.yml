@@ -1,0 +1,32 @@
+# Read-only gate before bootstrap and before any API change: the node must already run exactly
+# the pinned 3X-UI and bundled Xray. A mismatch is reported with both sides and changes nothing.
+- name: Require a WORLD release pin
+  ansible.builtin.assert:
+    that:
+      - world_xui_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')
+      - world_xray_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')
+      - world_xray_sha256 is match('^[0-9a-f]{64}$')
+    fail_msg: "Set xray.world_release (xui_version, xray_version, xray_sha256); see 'pipelinectl inventory'"
+
+- name: Read the installed WORLD release
+  ansible.builtin.command:
+    argv: [python3, "{{ world_remote_helper }}"]
+    stdin: "{{ {'action': 'release', 'binary': world_binary, 'panel_binary': world_panel_binary} | to_json }}"
+  register: world_release_run
+  changed_when: false
+
+- name: Require the installed WORLD release to equal the pin
+  ansible.builtin.assert:
+    that:
+      - world_installed.xui | regex_replace('^v', '') == world_xui_version
+      - world_installed.xray.version is match('^Xray ' ~ (world_xray_version | regex_escape) ~ '( |$)')
+      - world_installed.xray.sha256 == world_xray_sha256
+    fail_msg: >-
+      WORLD release differs from xray.world_release; nothing was changed.
+      Installed: 3X-UI {{ world_installed.xui }}, {{ world_installed.xray.version }},
+      Xray SHA256 {{ world_installed.xray.sha256 }}.
+      Pinned: 3X-UI {{ world_xui_version }}, Xray {{ world_xray_version }},
+      Xray SHA256 {{ world_xray_sha256 }}.
+      Upgrades and downgrades need a separate migration.
+  vars:
+    world_installed: "{{ world_release_run.stdout | from_json }}"

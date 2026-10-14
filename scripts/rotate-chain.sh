@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# rotate-chain.sh — one-command rotation of the proxy chain (Yandex bridge + Cherry exit).
+# rotate-chain.sh — one-command rotation of the proxy chain (Cherry Exit + RU bridge).
 #
 # Recreates the chosen instance(s) with new IPs/keys, re-probes the Reality target,
 # reconfigures Xray/3X-UI, and re-exports client links + QR. Encodes every gotcha the
@@ -13,12 +13,19 @@
 # the bridge (RU-side IP blocks pass ICMP but drop TCP); if not, the Exit is re-rolled for another
 # IP up to ROTATE_MAX_REROLLS (4) times and each blocked IP is logged to state/blocked_exit_ips.log.
 #
+# A RU bridge outside Terraform (bridge_manual in config/pipeline.yaml, e.g. VDSina) is not
+# recreated here: `bridge --bridge-ip NEW` moves it onto a server the operator has already
+# created (SSH key in place), keeps its identity, moves the DNS name and updates bridge_manual.ip,
+# so the client link survives. `exit` reconfigures that bridge onto the new Exit as usual.
+#
 # Usage:
 #   scripts/rotate-chain.sh [all|exit|bridge] [--region SLUG] [--plan SLUG] [--new-ip] [--yes]
+#   scripts/rotate-chain.sh bridge --bridge-ip NEW_IP        # manual RU bridge (no Terraform)
 #
 #   all     (default) recreate Exit + YC bridge VM (bridge keeps its reserved IP + identity)
 #   exit             recreate only the Exit
-#   bridge           recreate only the YC bridge VM (keeps its reserved IP + identity)
+#   bridge           recreate only the YC bridge VM (keeps its reserved IP + identity),
+#                    or with --bridge-ip move a manual bridge to that server
 #   --new-ip         with bridge|all: ALSO replace the reserved address and drop the saved bridge
 #                    identity -> the client QR changes. Without it the QR never changes.
 #   --region SLUG    set exit_region in terraform.tfvars first (e.g. SE-Stockholm)
@@ -29,7 +36,7 @@
 set -euo pipefail
 
 # ── args ───────────────────────────────────────────────────────────────────────
-TARGET="all"; ASSUME_YES=0; REGION=""; PLAN=""; NEW_IP=0
+TARGET="all"; ASSUME_YES=0; REGION=""; PLAN=""; NEW_IP=0; NEW_BRIDGE_IP=""
 [ $# -gt 0 ] && case "${1:-}" in all|exit|bridge) TARGET="$1"; shift;; esac
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,6 +44,7 @@ while [ $# -gt 0 ]; do
     --new-ip)  NEW_IP=1 ;;
     --region)  REGION="${2:-}"; shift ;;
     --plan)    PLAN="${2:-}";   shift ;;
+    --bridge-ip) NEW_BRIDGE_IP="${2:-}"; shift ;;
     all|exit|bridge) TARGET="$1" ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -44,6 +52,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$NEW_IP" = 1 ] && [ "$TARGET" = exit ]; then echo "--new-ip applies to the bridge: use 'bridge' or 'all'" >&2; exit 2; fi
+if [ -n "$NEW_BRIDGE_IP" ] && [ "$TARGET" != bridge ]; then echo "--bridge-ip applies to 'bridge' only" >&2; exit 2; fi
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TFDIR="$REPO/terraform"; TFVARS="$TFDIR/terraform.tfvars"
 KEY="${PROXY_PIPELINE_SSH_KEY:-$HOME/.ssh/proxy_pipeline}"
@@ -53,6 +62,43 @@ c() { printf '\033[1;36m[rotate] %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[rotate] %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31m[rotate] ERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 tf() { terraform -chdir="$TFDIR" "$@"; }
+manual_bridge() { # "ip user" of bridge_manual in config/pipeline.yaml, or nothing
+  python3 - "$REPO/config/pipeline.yaml" <<'PY'
+import sys, yaml
+m = (yaml.safe_load(open(sys.argv[1])) or {}).get("bridge_manual") or {}
+if isinstance(m, dict) and str(m.get("ip") or "").strip():
+    print(str(m["ip"]).strip(), str(m.get("ssh_user") or "root").strip())
+PY
+}
+set_manual_bridge_ip() { # rewrite bridge_manual.ip in place, keeping the rest of the file
+  python3 - "$REPO/config/pipeline.yaml" "$1" <<'PY'
+import re, sys
+path, ip = sys.argv[1], sys.argv[2]
+text = open(path).read()
+new, n = re.subn(r"(?m)^(bridge_manual:[ \t]*\n(?:[ \t]*(?:#.*)?\n|[ \t]+(?!ip:).*\n)*?[ \t]+ip:[ \t]*)\S+",
+                 lambda m: m.group(1) + ip, text, count=1)
+if n != 1:
+    sys.exit("bridge_manual.ip not found in " + path)
+open(path, "w").write(new)
+PY
+}
+wait_ssh() { # host user [need_marker]
+  local host="$1" user="$2" marker="${3:-}" i
+  for i in $(seq 1 60); do
+    if [ -n "$marker" ]; then
+      ssh -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes "$user@$host" 'test -f /opt/proxy-pipeline/.status' 2>/dev/null && return 0
+    else
+      ssh -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes "$user@$host" 'true' 2>/dev/null && return 0
+    fi
+    sleep 10
+  done
+  return 1
+}
+
+# Keep the original WORLD reachable until its API transaction has been recovered.
+if [ -e "$REPO/state/.world-transaction.json" ] || [ -L "$REPO/state/.world-transaction.json" ]; then
+  die "unfinished WORLD transaction: recover with configure on the original Exit before rotating"
+fi
 
 # ── 0. single instance: the watchdog may fire while an operator rotates by hand ────────
 exec 9>"$REPO/state/.rotate.lock"
@@ -64,12 +110,15 @@ flock -n 9 || die "another rotation is already running (state/.rotate.lock is he
 source "$REPO/.venv/bin/activate"
 [ -f "$REPO/.env" ] && { set +u; # shellcheck disable=SC1091
   source "$REPO/.env"; set -u; }
-# Yandex auth: prefer the service-account key file (long-lived) unless YC_TOKEN is set.
+# Yandex auth: prefer the service-account key file (long-lived) unless YC_TOKEN is set. Needed
+# only while the Yandex bridge module is enabled.
 if [ -z "${YC_TOKEN:-}" ] && [ -f "$REPO/config/key.json" ]; then
   export YC_SERVICE_ACCOUNT_KEY_FILE="$REPO/config/key.json"
 fi
-[ -n "${YC_TOKEN:-}" ] || [ -n "${YC_SERVICE_ACCOUNT_KEY_FILE:-}" ] || \
-  die "no Yandex auth — set YC_TOKEN or place the SA key at config/key.json"
+if grep -qE '^[[:space:]]*enable_yandex_bridge[[:space:]]*=[[:space:]]*true' "$TFVARS"; then
+  [ -n "${YC_TOKEN:-}" ] || [ -n "${YC_SERVICE_ACCOUNT_KEY_FILE:-}" ] || \
+    die "no Yandex auth — set YC_TOKEN or place the SA key at config/key.json"
+fi
 case "$(command -v ansible-playbook || true)" in
   "$REPO/.venv/"*) : ;;
   *) die "ansible-playbook is not from .venv (got '$(command -v ansible-playbook || echo none)') — venv activation failed" ;;
@@ -105,6 +154,52 @@ if [ "$TARGET" != bridge ]; then
   esac
 fi
 
+# ── 3b. manual RU bridge (outside Terraform): move it to the server given by --bridge-ip ──
+read -r MANUAL_IP MANUAL_USER <<<"$(manual_bridge)" || true
+if [ "$TARGET" = bridge ] && ! tf state list 2>/dev/null | grep -qE 'yandex_compute_instance\.bridge$'; then
+  [ -n "$MANUAL_IP" ] || [ -n "$NEW_BRIDGE_IP" ] || die "no bridge in Terraform and no bridge_manual in config/pipeline.yaml"
+  [ -n "$NEW_BRIDGE_IP" ] || die "the bridge is not managed by Terraform: create a new RU server with your SSH key, then run: pipelinectl rotate bridge --bridge-ip NEW_IP"
+  [ "$NEW_IP" = 1 ] && die "--new-ip is for the Yandex bridge; a manual bridge keeps its identity (delete state/bridge_identity.json for a new one)"
+  BRIDGE_USER="${MANUAL_USER:-root}"
+  c "manual bridge: ${MANUAL_IP:-none} -> $NEW_BRIDGE_IP (user $BRIDGE_USER)"
+  pipelinectl configure --preflight --bridge-only --bridge-ip "$NEW_BRIDGE_IP" --bridge-user "$BRIDGE_USER" \
+    || die "configure preflight failed — nothing was changed"
+  BRIDGE_LINKS_BEFORE="$(pipelinectl links --no-export --no-qr --format json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("bridge_xhttp",""))' 2>/dev/null || true)"
+  ssh-keygen -R "$NEW_BRIDGE_IP" >/dev/null 2>&1 || true
+  c "waiting for SSH on the new bridge ($NEW_BRIDGE_IP) …"
+  wait_ssh "$NEW_BRIDGE_IP" "$BRIDGE_USER" || die "no SSH to $BRIDGE_USER@$NEW_BRIDGE_IP — is the controller key in authorized_keys?"
+  c "configure --bridge-only on the new server (identity and certificate from state/)"
+  pipelinectl configure --bridge-only --bridge-ip "$NEW_BRIDGE_IP" --bridge-user "$BRIDGE_USER" \
+    || die "configure of the new bridge failed — DNS and config still point to the old bridge"
+  if python3 -c 'import sys, yaml; sys.exit(0 if ((yaml.safe_load(open(sys.argv[1])) or {}).get("bridge_entry") or {}).get("domain") else 1)' "$REPO/config/pipeline.yaml"; then
+    c "dns ensure --ip $NEW_BRIDGE_IP --replace (clients follow the name)"
+    pipelinectl dns ensure --ip "$NEW_BRIDGE_IP" --replace \
+      || die "the new bridge works but DNS was not moved — run: pipelinectl dns ensure --ip $NEW_BRIDGE_IP --replace"
+  fi
+  set_manual_bridge_ip "$NEW_BRIDGE_IP" || die "could not write bridge_manual.ip — set it to $NEW_BRIDGE_IP by hand"
+  c "bridge_manual.ip -> $NEW_BRIDGE_IP"
+  EXIT_IP="$(tf output -raw exit_ip 2>/dev/null || true)"
+  # An active Exit firewall admits the chain port only from the bridge: let the new one in.
+  if [ -n "$EXIT_IP" ] && ssh -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes root@"$EXIT_IP" \
+      'ufw status 2>/dev/null | grep -q "Status: active"' 2>/dev/null; then
+    c "Exit firewall is active — configure --exit-firewall-only (chain port for the new bridge)"
+    pipelinectl configure --exit-firewall-only || warn "Exit firewall not updated — run: pipelinectl configure --exit-firewall-only"
+  fi
+  pipelinectl links --export --qr >/dev/null
+  BRIDGE_LINKS_AFTER="$(pipelinectl links --no-export --no-qr --format json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("bridge_xhttp",""))' 2>/dev/null || true)"
+  FINAL_OK=1
+  pipelinectl validate --deep || { FINAL_OK=0; warn "END-TO-END CHECK FAILED (see [FAIL] above)"; }
+  if [ "$FINAL_OK" = 1 ]; then printf '\n\033[1;32m[rotate] DONE\033[0m\n'; else printf '\n\033[1;31m[rotate] DONE — WITH FAILURES (see above)\033[0m\n'; fi
+  echo "  Bridge:  $NEW_BRIDGE_IP (was ${MANUAL_IP:-none}) — delete the old server once clients work"
+  if [ -n "$BRIDGE_LINKS_BEFORE" ] && [ "$BRIDGE_LINKS_BEFORE" = "$BRIDGE_LINKS_AFTER" ]; then
+    echo "  Client link: UNCHANGED — clients keep working after their DNS cache expires (TTL 10 min)"
+  else
+    warn "client link CHANGED — re-issue it from $REPO/.client-links"
+  fi
+  [ "$FINAL_OK" = 1 ] || exit 1
+  exit 0
+fi
+
 # ── 4. resolve replace targets from live state (provider/index agnostic) ──────────
 EXIT_ADDR="$(tf state list 2>/dev/null | grep -E 'cherryservers_server\.exit$' | head -1 || true)"
 BRIDGE_ADDR="$(tf state list 2>/dev/null | grep -E 'yandex_compute_instance\.bridge$' | head -1 || true)"
@@ -136,7 +231,7 @@ fi
 bridge_links() {
   pipelinectl links --no-export --no-qr --format json 2>/dev/null | python3 -c '
 import json, sys
-d = json.load(sys.stdin); print(d.get("bridge_vless", ""), d.get("bridge_shadowsocks", ""))' 2>/dev/null || true
+d = json.load(sys.stdin); print(d.get("bridge_xhttp", ""), d.get("bridge_vless", ""), d.get("bridge_shadowsocks", ""))' 2>/dev/null || true
 }
 BRIDGE_LINKS_BEFORE="$(bridge_links)"
 
@@ -146,6 +241,19 @@ BRIDGE_LINKS_BEFORE="$(bridge_links)"
 # the plan may only delete/replace the resources this rotation targets.
 c "terraform init"
 tf init -input=false >/dev/null
+# Configuration inputs are checked while the old node still exists: a missing Xray pin,
+# firewall.direct_policy or panel password, or a WORLD whose bridge is not known to Terraform
+# (manual RU / direct-only not declared) would otherwise fail configure after the replacement.
+PREFLIGHT=(--preflight); [ "$TARGET" = bridge ] && PREFLIGHT+=(--bridge-only)
+c "configure ${PREFLIGHT[*]}"
+pipelinectl configure "${PREFLIGHT[@]}" || die "configure preflight failed — nothing was replaced; fix the configuration first"
+# A new Exit installs the 3X-UI archive pinned in terraform.tfvars and configure then demands the
+# Xray pinned in xray.world_release. Prove on the controller that both describe one artifact: a
+# wrong checksum found by cloud-init or configure would be found after the old Exit is gone.
+if [ "$TARGET" != bridge ]; then
+  c "world-release --verify (pinned 3X-UI archive + bundled Xray)"
+  pipelinectl world-release --verify || die "WORLD release pin not verified — nothing was replaced"
+fi
 PLANFILE="$TFDIR/.rotate.tfplan"
 trap 'rm -f "$PLANFILE"' EXIT   # never leave a plan (it embeds secrets) behind, however we exit
 
@@ -183,6 +291,7 @@ plan_and_apply confirm
 EXIT_IP="$(tf output -raw exit_ip 2>/dev/null || true)"
 BRIDGE_IP="$(tf output -raw bridge_ip 2>/dev/null || true)"
 BRIDGE_USER="$(tf output -raw bridge_ssh_user 2>/dev/null || true)"; BRIDGE_USER="${BRIDGE_USER:-ubuntu}"
+if [ -n "$MANUAL_IP" ]; then BRIDGE_IP="$MANUAL_IP"; BRIDGE_USER="${MANUAL_USER:-root}"; fi
 c "new Exit=$EXIT_IP  new Bridge=$BRIDGE_IP"
 if [ "$NEW_IP" = 1 ]; then
   rm -f "$REPO/state/bridge_identity.json"
@@ -192,18 +301,6 @@ fi
 for h in "$EXIT_IP" "$BRIDGE_IP"; do [ -n "$h" ] && ssh-keygen -R "$h" >/dev/null 2>&1 || true; done
 
 # ── 6. wait for the recreated node(s); the Exit must also answer TCP FROM THE BRIDGE ──────
-wait_ssh() { # host user [need_marker]
-  local host="$1" user="$2" marker="${3:-}" i
-  for i in $(seq 1 60); do
-    if [ -n "$marker" ]; then
-      ssh -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes "$user@$host" 'test -f /opt/proxy-pipeline/.status' 2>/dev/null && return 0
-    else
-      ssh -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes "$user@$host" 'true' 2>/dev/null && return 0
-    fi
-    sleep 10
-  done
-  return 1
-}
 # 2026-09-11: a fresh Cherry DE IP (84.32.98.23) answered TCP from this host but not one SYN from
 # the YC bridge reached it (ICMP did) — RU-side block of a recycled VPN range. Configuring the
 # bridge onto such an Exit takes the chain down for every client, so test TCP from the bridge
@@ -217,7 +314,7 @@ if [ "$TARGET" = bridge ]; then
   c "waiting for new bridge SSH ($BRIDGE_IP) …"
   wait_ssh "$BRIDGE_IP" "$BRIDGE_USER" || warn "bridge SSH not confirmed in ~10m (Ansible will still wait)"
 else
-  if [ "$TARGET" = all ] && [ -n "$BRIDGE_IP" ]; then
+  if [ "$TARGET" = all ] && [ -n "$BRIDGE_IP" ] && [ -z "$MANUAL_IP" ]; then
     c "waiting for new bridge SSH ($BRIDGE_IP) …"
     wait_ssh "$BRIDGE_IP" "$BRIDGE_USER" || warn "bridge SSH not confirmed in ~10m"
   fi
@@ -276,7 +373,8 @@ if [ "$TARGET" = bridge ]; then
   pipelinectl configure --bridge-only
 else
   c "configure (Exit role → Bridge role)"
-  pipelinectl configure
+  # exit/all provisioned a replacement WORLD; initialize its empty panel once.
+  pipelinectl configure --bootstrap-panel
 fi
 
 # ── 9. links + QR ────────────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ import base64
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import qrcode
 from qrcode.image.pure import PyPNGImage
@@ -48,6 +49,28 @@ def build_bridge_vless(d: dict[str, Any]) -> str | None:
     )
 
 
+def build_bridge_xhttp(d: dict[str, Any]) -> str | None:
+    """Main bridge profile: VLESS + XHTTP + TLS to the bridge's own name.
+
+    The address is the domain, never the IP, so moving the bridge is a DNS change and the client
+    keeps its link. No flow: vision belongs to the RAW profile. Nothing about the RU -> WORLD
+    chain (its UUID, key or target) is in a client link.
+
+    fp=firefox, not chrome: on 2026-10-14 the chrome (and plain Go) ClientHello, too large for one
+    TCP segment, stalled after 2-3 connections on the path to the entry; firefox and safari passed
+    10 of 10, and v2rayN on Windows recovered after switching to firefox.
+    """
+    domain, uuid, path = d.get("bridge_domain"), d.get("bridge_xhttp_uuid"), d.get("bridge_xhttp_path")
+    if not (domain and uuid and path):
+        return None
+    port = d.get("bridge_https_port") or 443
+    mode = d.get("bridge_xhttp_mode") or "auto"
+    return (
+        f"vless://{uuid}@{domain}:{port}?encryption=none&security=tls&sni={domain}&alpn=h2&fp=firefox"
+        f"&type=xhttp&host={domain}&path={quote(path, safe='')}&mode={mode}#Bridge-XHTTP-{domain}"
+    )
+
+
 def build_bridge_ss(d: dict[str, Any]) -> str | None:
     if not d.get("bridge_ip"):
         return None
@@ -65,8 +88,11 @@ def build_client_links_map(d: dict[str, Any]) -> dict[str, str]:
         "direct_vless": build_direct_vless(d),
         "direct_shadowsocks": build_direct_ss(d),
     }
+    bridge_xhttp = build_bridge_xhttp(d)
     bridge_vless = build_bridge_vless(d)
     bridge_shadowsocks = build_bridge_ss(d)
+    if bridge_xhttp:
+        out["bridge_xhttp"] = bridge_xhttp
     if bridge_vless:
         out["bridge_vless"] = bridge_vless
     if bridge_shadowsocks:
@@ -94,6 +120,7 @@ def export_client_links(
     links_map = build_client_links_map(d)
     direct_v = links_map["direct_vless"]
     direct_s = links_map["direct_shadowsocks"]
+    bx = links_map.get("bridge_xhttp")
     bv = links_map.get("bridge_vless")
     bs = links_map.get("bridge_shadowsocks")
     if fmt == "json":
@@ -102,6 +129,8 @@ def export_client_links(
             "direct_shadowsocks": direct_s,
             "panel_url": d.get("panel_url", ""),
         }
+        if bx:
+            out["bridge_xhttp"] = bx
         if bv:
             out["bridge_vless"] = bv
         if bs:
@@ -116,8 +145,10 @@ def export_client_links(
         direct_s,
         "",
     ]
+    if bx:
+        lines += ["# THROUGH BRIDGE: HTTPS + XHTTP (main profile)", bx, ""]
     if bv and bs:
-        lines += ["# THROUGH BRIDGE", bv, "", bs, ""]
+        lines += ["# THROUGH BRIDGE: RAW/REALITY and SS2022 (reserve)" if bx else "# THROUGH BRIDGE", bv, "", bs, ""]
     text = "\n".join(lines)
     if write_file:
         (repo_root / ".client-links").write_text(text, encoding="utf-8")

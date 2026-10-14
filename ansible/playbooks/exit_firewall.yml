@@ -1,6 +1,7 @@
 ---
-# Standalone: (re)apply the Exit firewall without touching inbounds (the exit role is not
-# idempotent). `pipelinectl configure --exit-firewall-only`.
+# Standalone: (re)apply the Exit firewall without touching inbounds
+# (`pipelinectl configure --exit-firewall-only`), or restore a saved one
+# (`pipelinectl configure --exit-firewall-rollback latest`).
 - name: Exit firewall
   hosts: exit
   gather_facts: false

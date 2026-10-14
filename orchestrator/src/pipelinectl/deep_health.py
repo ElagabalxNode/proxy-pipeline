@@ -1,4 +1,8 @@
-"""Deep health checks: 3X-UI API, Exit egress IP, TLS handshake for Reality."""
+"""Deep health checks: 3X-UI API, Exit egress IP, TLS handshake for Reality.
+
+The panel is reached only through an SSH tunnel to its loopback listener on WORLD: the
+firewall does not open the panel port, and no credentials cross the internet in plain HTTP.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +10,12 @@ import json
 import socket
 import ssl
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any
@@ -28,14 +35,59 @@ def _panel_request_prefix(panel_path: str) -> str:
     return f"/{p}" if p else ""
 
 
-def _login_base_url(data: dict[str, Any]) -> str:
-    panel_url = str(data.get("panel_url") or "").rstrip("/")
-    if panel_url.startswith("http"):
-        return panel_url
-    exit_ip = str(data.get("exit_ip") or "")
-    port = str(data.get("panel_port") or "2053")
-    prefix = _panel_request_prefix(str(data.get("panel_path") or "/"))
-    return f"http://{exit_ip}:{port}{prefix}".rstrip("/")
+def _panel_endpoint(data: dict[str, Any]) -> tuple[int, str]:
+    """Panel port and request prefix on WORLD; the public panel_url is never dialled."""
+    port = int(data.get("panel_port") or 2053)
+    return port, _panel_request_prefix(str(data.get("panel_path") or "/"))
+
+
+@contextmanager
+def _panel_tunnel(
+    exit_ip: str, exit_user: str, exit_key: Path, panel_port: int
+) -> Iterator[str]:
+    """Forward a free loopback port to the panel's loopback listener; yields the local origin."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        local = sock.getsockname()[1]
+    cmd = [
+        "ssh",
+        "-i",
+        str(exit_key),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-N",
+        "-L",
+        f"127.0.0.1:{local}:127.0.0.1:{panel_port}",
+        f"{exit_user}@{exit_ip}",
+    ]
+    with subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ) as proc:
+        try:
+            deadline = time.monotonic() + 15
+            while True:
+                if proc.poll() is not None:
+                    raise OSError(f"ssh tunnel to {exit_ip} exited with {proc.returncode}")
+                try:
+                    with socket.create_connection(("127.0.0.1", local), timeout=0.2):
+                        break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise OSError(f"ssh tunnel to {exit_ip} timed out") from None
+                    time.sleep(0.1)
+            yield f"http://127.0.0.1:{local}"
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 def _panel_csrf_token(base: str, opener: urllib.request.OpenerDirector) -> str | None:
@@ -55,15 +107,17 @@ def _panel_csrf_token(base: str, opener: urllib.request.OpenerDirector) -> str |
 
 
 def _panel_login(
-    data: dict[str, Any],
+    base: str,
+    user: str,
     panel_pass: str,
     jar: CookieJar,
 ) -> tuple[bool, str, urllib.request.OpenerDirector]:
-    base = _login_base_url(data)
     login_url = f"{base}/login"
-    user = str(data.get("panel_user") or "admin")
     body = urllib.parse.urlencode({"username": user, "password": panel_pass}).encode()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    # The tunnel end is loopback: an HTTP proxy from the environment must not see the login.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(jar)
+    )
     csrf = _panel_csrf_token(base, opener)
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     if csrf:
@@ -93,10 +147,9 @@ def _panel_login(
 
 
 def _panel_inbounds_list(
-    data: dict[str, Any],
+    base: str,
     opener: urllib.request.OpenerDirector,
 ) -> tuple[bool, str]:
-    base = _login_base_url(data)
     list_url = f"{base}/panel/api/inbounds/list"
     csrf = _panel_csrf_token(base, opener)
     req = urllib.request.Request(
@@ -190,6 +243,47 @@ def _tls_reality_probe(host: str, port: int, server_hostname: str) -> tuple[bool
     return True, f"handshake_ok sni={server_hostname} cn={cn or '?'}"
 
 
+def _entry_https_probe(
+    domain: str, bridge_ip: str, port: int, cafile: str | None = None,
+    resolve: Any = socket.getaddrinfo,
+) -> list[CheckResult]:
+    """The HTTPS entry as a client outside the bridge sees it: public DNS, then TLS and the page.
+
+    DNS and TLS are separate results on purpose: a wrong or missing record and a broken
+    certificate need different fixes, and neither is a reason to touch the Exit.
+    """
+    try:
+        resolved = sorted({info[4][0] for info in resolve(domain, port, type=socket.SOCK_STREAM)})
+    except OSError as e:
+        resolved, dns_detail = [], f"{domain} does not resolve: {e}"
+    else:
+        dns_detail = f"{domain} -> {', '.join(resolved)}"
+    dns_ok = resolved == [bridge_ip]
+    if resolved and not dns_ok:
+        dns_detail += f" (expected only {bridge_ip})"
+    results = [CheckResult("entry_dns", dns_ok, "info" if dns_ok else "error", dns_detail)]
+    context = ssl.create_default_context(cafile=cafile)
+    try:
+        with socket.create_connection((bridge_ip, port), timeout=10) as sock, \
+                context.wrap_socket(sock, server_hostname=domain) as tls:
+            tls.sendall(f"GET / HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n".encode())
+            status = tls.recv(64).split(b"\r\n", 1)[0].decode(errors="replace")
+            protocol = tls.version()
+    except ssl.SSLCertVerificationError as e:
+        # A certificate that does not validate is wrong from every vantage point.
+        results.append(CheckResult("entry_https", False, "error", f"certificate: {e}"))
+    except OSError as e:  # includes handshake timeouts and resets
+        # Reachability from the controller's network says little about clients: on 2026-10-13
+        # this path timed out while Russian and German vantage points got the page. The bridge's
+        # own bridge_entry_https check is the one that fails the report.
+        results.append(CheckResult(
+            "entry_https", False, "warn", f"not reachable from the controller ({bridge_ip}:{port}): {e}"))
+    else:
+        ok = " 200" in status
+        results.append(CheckResult("entry_https", ok, "info" if ok else "error", f"{protocol} {status}"))
+    return results
+
+
 BRIDGE_PROBE_SCRIPT = "/usr/local/bin/chain-probe.sh"
 BRIDGE_PROBE_LOG = "/var/log/chain-probe/probe.jsonl"
 
@@ -207,7 +301,7 @@ def _bridge_probe_round(
     """
     remote = (
         f"test -x {BRIDGE_PROBE_SCRIPT} || {{ echo NO_PROBE; exit 3; }}; "
-        f"sudo {BRIDGE_PROBE_SCRIPT} && sudo tail -n 8 {BRIDGE_PROBE_LOG}"
+        f"sudo {BRIDGE_PROBE_SCRIPT} && sudo tail -n 16 {BRIDGE_PROBE_LOG}"
     )
     cmd = [
         "ssh",
@@ -270,12 +364,25 @@ def run_deep_health(
         )
         return rpt
 
-    jar = CookieJar()
-    ok_login, msg_login, opener = _panel_login(data, panel_pass, jar)
-    rpt.add(CheckResult("panel_login", ok_login, "error" if not ok_login else "info", msg_login))
-
+    panel_port, prefix = _panel_endpoint(data)
+    user = str(data.get("panel_user") or "admin")
+    ok_login, msg_login, ok_ib, msg_ib = False, "", False, ""
+    try:
+        with _panel_tunnel(exit_ip, exit_user, exit_key, panel_port) as origin:
+            ok_login, msg_login, opener = _panel_login(
+                f"{origin}{prefix}", user, panel_pass, CookieJar()
+            )
+            if ok_login:
+                ok_ib, msg_ib = _panel_inbounds_list(f"{origin}{prefix}", opener)
+    except OSError as e:
+        ok_login, msg_login = False, str(e)
+    via = f"via ssh to 127.0.0.1:{panel_port}"
+    rpt.add(
+        CheckResult(
+            "panel_login", ok_login, "info" if ok_login else "error", msg_login if msg_login else via
+        )
+    )
     if ok_login:
-        ok_ib, msg_ib = _panel_inbounds_list(data, opener)
         rpt.add(CheckResult("panel_inbounds", ok_ib, "error" if not ok_ib else "info", msg_ib))
     else:
         rpt.add(CheckResult("panel_inbounds", False, "warn", "skipped: login failed"))
@@ -291,10 +398,18 @@ def run_deep_health(
     else:
         rpt.add(CheckResult("tls_reality", False, "warn", "reality_sni missing in runtime"))
 
+    entry_domain = str(data.get("bridge_domain") or "")
+    if bridge_ip and entry_domain:
+        for check in _entry_https_probe(entry_domain, bridge_ip, int(data.get("bridge_https_port") or 443)):
+            rpt.add(check)
+
     if bridge_ip and bridge_key:
         ok_p, msg_p, recs = _bridge_probe_round(bridge_ip, bridge_user, bridge_key)
         if not ok_p:
             rpt.add(CheckResult("bridge_probe", False, "warn", msg_p))
+        # Reference checks do not fail the report: the bridge's direct egress is never used by
+        # clients, and with the HTTPS entry the Reality dest matters only to the reserve profile.
+        reference = {"direct_http"} | ({"dest_tls"} if entry_domain else set())
         for r in recs:
             good = r.get("ok") is True
             detail = f"{r.get('ms')}ms"
@@ -302,10 +417,9 @@ def run_deep_health(
                 detail += f" http={r.get('code')}"
             if r.get("err"):
                 detail += f" {r.get('err')}"
+            failed = "warn" if r.get("check") in reference else "error"
             rpt.add(
-                CheckResult(
-                    f"bridge_{r.get('check')}", good, "error" if not good else "info", detail
-                )
+                CheckResult(f"bridge_{r.get('check')}", good, failed if not good else "info", detail)
             )
 
     return rpt

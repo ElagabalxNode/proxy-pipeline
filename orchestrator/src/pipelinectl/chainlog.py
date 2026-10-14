@@ -7,6 +7,11 @@ check per round, three checks per round sharing one `ts`:
   chain_http   HTTP through the whole chain (bridge -> Exit -> internet)
   direct_http  HTTP from the bridge directly, no Exit       (reference)
   dest_tls     TLS to the bridge's own Reality dest         (client handshakes stall if this fails)
+
+With the HTTPS entry enabled the probe adds two more:
+
+  entry_https  the bridge's own HTTPS name, as a client sees it  (clients cannot connect if this fails)
+  entry_cert   that certificate is not about to expire           (a warning; clients still connect)
 """
 
 from __future__ import annotations
@@ -21,7 +26,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-CHECKS = ("tls_exit", "chain_http", "direct_http", "dest_tls")
+CHECKS = ("tls_exit", "chain_http", "direct_http", "dest_tls", "entry_https", "entry_cert")
+# Checks of the bridge itself. None of them says anything about the Exit: a verdict built only
+# from these must never look like a reason to rotate it.
+SIDE_NOTES = {
+    "dest_tls": "Reality dest down (client handshakes stall)",
+    "entry_https": "HTTPS entry down (clients cannot connect)",
+    "entry_cert": "HTTPS certificate expires soon",
+}
 REMOTE_LOG_DIR = "/var/log/chain-probe/"
 LOG_BASENAME = "probe.jsonl"
 
@@ -84,6 +96,8 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for c in CHECKS:
         rs = [r for r in records if r["check"] == c]
+        if not rs and c.startswith("entry_"):
+            continue  # a bridge without the HTTPS entry does not run these
         oks = [int(r.get("ms") or 0) for r in rs if r.get("ok") is True]
         fail = sum(1 for r in rs if r.get("ok") is not True)
         out[c] = {
@@ -113,9 +127,14 @@ class Window:
 
 def verdict(failed: set[str]) -> str:
     chain, hop, direct = "chain_http" in failed, "tls_exit" in failed, "direct_http" in failed
-    dest = "dest_tls" in failed
-    if dest and not (chain or hop or direct):
-        return "Reality dest unreachable from the bridge — client handshakes stall (change bridge SNI/dest)"
+    if not (chain or hop or direct):
+        if "entry_https" in failed:
+            return "HTTPS entry of the bridge down — clients cannot connect (nginx or certificate on the bridge)"
+        if "dest_tls" in failed:
+            return "Reality dest unreachable from the bridge — client handshakes stall (change bridge SNI/dest)"
+        if "entry_cert" in failed:
+            return "HTTPS certificate of the bridge expires soon — renew it (clients still connect)"
+        return "ok"
     if chain and direct:
         return "bridge egress / RU border — everything from the bridge failed (clients down)"
     if chain and hop:
@@ -130,10 +149,11 @@ def verdict(failed: set[str]) -> str:
 
 
 def verdict_with_dest(failed: set[str]) -> str:
-    base = verdict(failed - {"dest_tls"}) if failed - {"dest_tls"} else "ok"
-    if "dest_tls" in failed and base != "ok":
-        return base + " + Reality dest down (client handshakes stall)"
-    return verdict(failed)
+    core = failed - set(SIDE_NOTES)
+    base = verdict(core) if core else "ok"
+    if base == "ok":
+        return verdict(failed)
+    return base + "".join(f" + {note}" for check, note in SIDE_NOTES.items() if check in failed)
 
 
 def failure_windows(records: list[dict[str, Any]], gap_s: int = 150) -> list[Window]:

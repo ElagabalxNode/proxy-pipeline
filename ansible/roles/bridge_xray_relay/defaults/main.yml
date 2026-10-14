@@ -1,13 +1,66 @@
 pipeline_state_dir: "{{ playbook_dir }}/../../state"
 
+# No implicit latest version or upgrades. SHA256 is for the chosen architecture's ZIP.
+bridge_xray_version: ""
+bridge_xray_archive_sha256: ""
+bridge_xray_archive_path: ""  # optional offline archive on the controller
+bridge_xray_cache_dir: /var/cache/proxy-pipeline/xray
+bridge_xray_binary: /usr/local/bin/xray
+bridge_xray_config: /usr/local/etc/xray/config.json
+bridge_xray_asset_dir: /usr/local/share/xray
+bridge_xray_log_dir: /var/log/xray
+bridge_xray_unit_path: /etc/systemd/system/xray.service
+bridge_xray_service_user: nobody
+bridge_support_path: /usr/local/libexec/proxy-pipeline/bridge_support.py
+bridge_systemctl: /usr/bin/systemctl
+bridge_start_timeout: 60
+
 # How the bridge relays to the Exit:
 #   xhttp - VLESS/xhttp+Reality to Exit:CHAIN_PORT (default; used by the Yandex bridge).
 #   ss    - Shadowsocks-2022 to the Exit's existing :ss_port inbound (no vision, not xHTTP).
 # Timeweb's egress network breaks the xhttp/HTTP-2 tunnel to the Exit, and vision must not
 # be used on a relay hop — so the Timeweb bridge relays via SS-2022 (reuses the Exit's SS
-# inbound; no Exit change). pipelinectl picks the mode per active provider; default stays
-# xhttp so the existing Yandex bridge is unaffected.
+# inbound; no Exit change). pipelinectl uses --chain-mode, then PROXY_PIPELINE_CHAIN_MODE,
+# then the active provider default. The client-facing port is configured independently.
 bridge_chain_mode: xhttp
+
+# Client entry VLESS + XHTTP for the HTTPS reverse proxy in front of it (own domain and
+# certificate). Loopback only: without the proxy nothing can reach it.
+# The mode is what the SERVER accepts; the client application picks its own, and several ignore
+# the mode in a share link (2026-10-13: Shadowrocket and v2rayN could not connect to a
+# stream-up-only entry; Xray answered their requests with 400).
+#   auto      - accept every XHTTP mode (default); nginx relays with grpc_pass (HTTP/2 to Xray).
+#   stream-up - accept only the one-long-request upload; same nginx relay.
+#   packet-up - accept only uploads cut into POSTs, relayed over HTTP/1.1: for a path with a
+#               buffering middlebox such as a CDN, which stream modes do not survive.
+# Xray 25.10.15 was measured to damage some large packet-up uploads; 26.3.27 was not.
+bridge_xhttp_enabled: false
+bridge_xhttp_port: 10443
+bridge_xhttp_mode: auto
+
+# HTTPS front of the XHTTP entry (tasks/https.yml). A name here puts nginx on the public port
+# with the certificate delivered from the controller; the RAW/REALITY inbound must then listen
+# elsewhere (bridge_reality_port). Empty = no nginx, the bridge works as before.
+bridge_https_domain: ""
+bridge_https_cert: ""                  # controller path: certificate with its chain
+bridge_https_key: ""                   # controller path: private key
+bridge_https_port: 443
+bridge_https_http_port: 80             # plain HTTP only redirects to HTTPS; 0 = do not listen
+bridge_https_site_dir: ""              # controller directory with a static site; empty = built-in page
+bridge_https_site_names: []            # other names of the zone (bare domain, www) that get only the page
+bridge_https_body_size: 2m             # packet-up only: above one XHTTP POST (about 1 MB by default)
+bridge_https_timeout: 3600             # idle seconds before nginx gives up on a tunnel request
+bridge_https_install_package: true
+bridge_https_binary: /usr/sbin/nginx
+bridge_https_conf: /etc/nginx/nginx.conf
+bridge_https_mime_types: /etc/nginx/mime.types
+bridge_https_dir: /etc/nginx/proxy-pipeline
+bridge_https_webroot: /var/www/proxy-pipeline
+bridge_https_temp_dir: /var/lib/nginx
+bridge_https_log_dir: /var/log/nginx
+bridge_https_pid: /run/nginx.pid
+bridge_https_user: www-data
+bridge_https_ca_file: ""               # CA for the local check; empty = system trust store
 
 # ── Chain probe: continuous evidence of WHERE a stall happens (templates/chain-probe.sh.j2) ──
 # Runs on the bridge every chain_probe_interval; the controller mirrors the log directory into
@@ -20,6 +73,7 @@ chain_probe_direct_port: 1081     # loopback SOCKS -> bridge direct egress (refe
 chain_probe_timeout: 15           # seconds per check; 3 checks fit well inside a minute
 chain_probe_interval: 60s
 chain_probe_keep_days: 14
+chain_probe_cert_days: 14         # entry_cert fails when the HTTPS certificate has fewer days left
 chain_probe_pull_interval: 5min
 chain_probe_pull_dir: "{{ pipeline_state_dir }}/probe"
 

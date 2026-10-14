@@ -89,7 +89,7 @@ def rotation_in_progress(state_dir: Path) -> bool:
 def classify_live_round(recs: list[dict[str, Any]]) -> tuple[str, str]:
     """('ok'|'exit'|'bridge', verdict) from one live probe round on the bridge."""
     failed = {str(r.get("check")) for r in recs if r.get("ok") is not True}
-    if not ({"chain_http", "tls_exit"} & failed):
+    if "chain_http" not in failed:
         return "ok", "live probe round on the bridge passed"
     v = chainlog.verdict(failed)
     return ("bridge" if any(m in v for m in BRIDGE_MARKERS) else "exit"), v
