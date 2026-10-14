@@ -1,5 +1,11 @@
 # Ранбук: ротация и пересоздание цепочки YC-bridge + Exit (Cherry)
 
+> **Актуальная связка (с 2026-10-14): Exit на Cherry + мост на RU VPS вне Terraform (VDSina) +
+> DNS в Timeweb.** Для неё этот ранбук — историческая справка. Диагностика и замена узлов:
+> `pipelinectl status`, затем `pipelinectl rotate exit --yes` или
+> `pipelinectl rotate bridge --bridge-ip <НОВЫЙ_IP>` — см. раздел «Если что-то отвалилось» в
+> [README](../README.md).
+
 Полная **ротация старых серверов** и **пересоздание всей цепочки**
 `Клиент → Bridge (Yandex Cloud) → Exit (Cherry Servers) → интернет`,
 опционально **со сменой региона Exit в Cherry**.
@@ -91,7 +97,7 @@ terraform apply -replace='module.exit.cherryservers_server.exit' \
 cd /root/proxy-pipeline
 # дождаться SSH/cloud-init на новом Exit (~3–5 мин), затем:
 pipelinectl probe-targets                 # ре-проба из НОВОГО региона → лучший SNI
-pipelinectl configure                     # Exit-роль (новые ключи) + Bridge-роль (xhttp на новый Exit)
+pipelinectl configure --bootstrap-panel   # новая пустая панель Exit + Bridge (xhttp на новый Exit)
 pipelinectl validate --deep
 pipelinectl links --export --qr
 ```
@@ -265,23 +271,35 @@ pipelinectl probe-targets
 
 ## Фаза 5 (🧑). Настроить цепочку (`configure`)
 
+Перед применением заполнить pin RU `xray.bridge_release` и пройти предпосылки F3–F6
+из [актуального спринта](SPRINT-1.md). В `config/pipeline.yaml` должна быть выбрана
+`firewall.direct_policy` (`public`/`allowlist`/`closed`, значения по умолчанию нет); ручной RU
+передаётся через `--bridge-ip`, WORLD без моста — только `--direct-only`. `rotate` проверяет эти
+входные данные (`configure --preflight`) и pin WORLD (`world-release --verify`: `xui_version` и
+`xui_archive_sha256` в `terraform.tfvars` против `xray.world_release`) до замены узлов. Раздельный firewall проверен локально,
+на рабочих узлах не применялся: этот runbook не подтверждает готовность к живой миграции.
+Возврат прежних правил портов: `pipelinectl configure --exit-firewall-rollback latest`.
+
 ```bash
 cd /root/proxy-pipeline
-pipelinectl configure
+pipelinectl configure --bootstrap-panel  # первый запуск новой пустой панели
 ```
 
 Что делает полный `configure` (`cli.py:_do_configure`):
 
 - пишет `ansible/inventory/hosts.ini` из `terraform output` (`exit_ip`, `bridge_ip`=YC, user=`ubuntu`);
 - `chain_mode` авто = `xhttp` (Timeweb из стейта убран), `bridge_reality_port=443`;
-- запускает `site.yml`: **роль Exit** (поднимает 3X-UI, генерит свежие ключи/UUID/short_id/SS-пароль,
-создаёт 3 inbound'а, пишет `state/runtime.json`), затем **роль Bridge** (ставит xray, генерит
-ключи моста, поднимает VLESS+Reality:443 с outbound-цепочкой `xhttp+Reality` на `Exit:chain_port`,
-пишет `state/bridge_runtime.json`).
+- запускает `site.yml`: **роль Exit** при явном bootstrap сохраняет backup пустой SQLite БД и
+задаёт credentials/path панели. Далее через SSH-туннель сохраняет live identity, либо создаёт её
+для нового WORLD без подходящего backup; валидирует полный конфиг, обновляет managed inbound
+по ID и пишет `state/runtime.json` после проверок. **Роль Bridge** доставляет закреплённый Xray,
+восстанавливает identity моста, поднимает VLESS+Reality:443 с outbound `xhttp+Reality` на
+`Exit:chain_port` и сохраняет `state/bridge_runtime.json` с откатом при ошибке.
 
-> ⚠️ Роль Exit **не идемпотентна** (добавляет inbound'ы и сбрасывает панель в `admin/admin` на старте).
-> Поэтому её гоняем **только на свежесозданном** Exit (что мы и делаем). Не запускай `configure`
-> повторно на уже настроенном живом Exit — будут дубли inbound'ов.
+Повторное применение выполняется без `--bootstrap-panel`: обычный configure больше не сбрасывает
+панель и не пересоздаёт неизменённые inbound. Если остался `state/.world-transaction.json`,
+восстановить доступ к прежнему WORLD и выполнить configure для отката, затем повторить configure
+для применения. До восстановления ротация блокируется. [Подробности и границы отката](../orchestrator/README.md#world-identity-and-api-recovery).
 
 ---
 
