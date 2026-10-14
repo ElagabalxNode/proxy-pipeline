@@ -9,5 +9,15 @@
   "bridge_reality_dest": "{{ bridge_reality_dest }}",
   "bridge_ss_method": "{{ bridge_ss_method }}",
   "bridge_ss_password": "{{ bridge_ss_password }}",
+{% if bridge_https_domain %}
+  "bridge_domain": "{{ bridge_https_domain }}",
+  "bridge_https_port": {{ bridge_https_port | int }},
+{% endif %}
+{% if bridge_xhttp_enabled %}
+  "bridge_xhttp_uuid": "{{ bridge_xhttp_uuid }}",
+  "bridge_xhttp_path": "{{ bridge_xhttp_path }}",
+  "bridge_xhttp_mode": "{{ bridge_xhttp_mode }}",
+  "bridge_xhttp_port": {{ bridge_xhttp_port | int }},
+{% endif %}
   "bridge_ss_port": {{ exit_state.ss_port | int }}
 }

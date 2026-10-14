@@ -1,0 +1,37 @@
+version: 1
+
+# Trial candidates from SPRINT-1 E3; availability has NOT been measured.
+# pipelinectl probe-targets --purpose chain probes from WORLD and writes
+# state/chain_reality_target.json. It does not replace the live direct target.
+# Passing this probe does not establish RU -> WORLD XHTTP/REALITY availability.
+targets:
+  - id: storage-yandex
+    sni: storage.yandex.net
+    dest: storage.yandex.net:443
+    expected_alpn: [h2]
+    priority: 1
+    enabled: true
+  - id: yastatic
+    sni: yastatic.net
+    dest: yastatic.net:443
+    expected_alpn: [h2]
+    priority: 1
+    enabled: true
+  - id: cdnvideo
+    sni: cdnvideo.ru
+    dest: cdnvideo.ru:443
+    expected_alpn: [h2]
+    priority: 1
+    enabled: true
+  - id: okcdn
+    sni: okcdn.ru
+    dest: okcdn.ru:443
+    expected_alpn: [h2]
+    priority: 1
+    enabled: true
+  - id: userapi
+    sni: userapi.com
+    dest: userapi.com:443
+    expected_alpn: [h2]
+    priority: 1
+    enabled: true

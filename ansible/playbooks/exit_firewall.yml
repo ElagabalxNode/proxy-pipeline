@@ -1,0 +1,11 @@
+---
+# Standalone: (re)apply the Exit firewall without touching inbounds
+# (`pipelinectl configure --exit-firewall-only`), or restore a saved one
+# (`pipelinectl configure --exit-firewall-rollback latest`).
+- name: Exit firewall
+  hosts: exit
+  gather_facts: false
+  vars:
+    pipeline_state_dir: "{{ playbook_dir }}/../../state"
+  roles:
+    - role: exit_firewall

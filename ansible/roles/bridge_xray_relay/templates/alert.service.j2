@@ -1,0 +1,9 @@
+[Unit]
+Description=proxy-pipeline watchdog: chain DOWN → auto-rotate the Exit, alert if that fails (e-mail/SMS/Telegram)
+After=proxy-pipeline-probe-pull.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=3900
+WorkingDirectory={{ pipeline_repo_root }}
+ExecStart={{ pipeline_repo_root }}/.venv/bin/pipelinectl watchdog

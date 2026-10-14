@@ -2,53 +2,26 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import shlex
 import subprocess
-import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-# ─── Remote probe script (runs as `python3 -c <code>` on Exit VPS) ──────────
-# Embedded targets JSON is passed via base64 to avoid shell quoting issues.
-_REMOTE_PROBE_TEMPLATE = textwrap.dedent("""\
-    import json, base64, ssl, socket, time
-    targets = json.loads(base64.b64decode({b64}).decode())
-    results = []
-    for t in targets:
-        host = t['sni']
-        port = int(t.get('port', 443))
-        tls_ok = False
-        rtt_ms = None
-        alpn = ''
-        try:
-            t0 = time.monotonic()
-            sock = socket.create_connection((host, port), timeout=10)
-            t1 = time.monotonic()
-            ctx = ssl.create_default_context()
-            with ctx.wrap_socket(sock, server_hostname=host) as tls:
-                alpn = tls.selected_alpn_protocol() or ''
-                tls_ok = True
-            sock.close()
-            rtt_ms = round((t1 - t0) * 1000, 1)
-        except Exception as exc:
-            pass
-        results.append({{
-            'id': t['id'], 'sni': t['sni'], 'dest': t['dest'],
-            'tls_ok': tls_ok, 'rtt_ms': rtt_ms, 'alpn': alpn,
-            'priority': int(t.get('priority', 2)),
-        }})
-    print(json.dumps(results))
-""")
+def _passed(r: dict[str, Any]) -> bool:
+    # The optional fields retain compatibility with historical reports/tests.
+    return bool(
+        r.get("tls_ok") and r.get("alpn_ok", True) and r.get("eligible", True)
+        and r.get("rtt_ms") is not None
+    )
 
 
 def _score(r: dict[str, Any]) -> float:
     """Higher is better. Returns <0 if target failed TLS."""
-    if not r.get("tls_ok") or r.get("rtt_ms") is None:
+    if not _passed(r):
         return -1.0
     rtt_score = max(0.0, 100.0 - float(r["rtt_ms"]))
     priority_bonus = (2 - int(r.get("priority", 2))) * 10.0
@@ -70,10 +43,9 @@ def probe_targets_on_exit(
     exit_key: Path,
 ) -> list[dict[str, Any]]:
     """SSH to Exit VPS and run TLS+RTT probes for each target. Returns raw results."""
-    fields = ["id", "sni", "dest", "port", "priority"]
+    fields = ["id", "sni", "dest", "priority", "expected_alpn"]
     slim = [{k: t[k] for k in fields if k in t} for t in targets]
-    b64 = base64.b64encode(json.dumps(slim).encode()).decode()
-    script = _REMOTE_PROBE_TEMPLATE.format(b64=repr(b64))
+    script = Path(__file__).with_name("target_probe.py").read_text(encoding="utf-8")
 
     ssh_cmd = [
         "ssh",
@@ -83,15 +55,17 @@ def probe_targets_on_exit(
         f"{exit_user}@{exit_ip}",
         f"python3 -c {shlex.quote(script)}",
     ]
+    timeout = 30 + len(targets) * 25  # TCP + TLS timeout per candidate, plus SSH overhead.
     try:
         proc = subprocess.run(
             ssh_cmd,
+            input=json.dumps(slim),
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError("SSH probe timed out (180 s)") from e
+        raise RuntimeError(f"SSH probe timed out ({timeout} s)") from e
     if proc.returncode != 0:
         raise RuntimeError(
             f"SSH probe failed (exit {proc.returncode}):\n"
@@ -112,11 +86,11 @@ def pick_winner(
     exit_region: str,
 ) -> dict[str, Any]:
     """Select best target; raise RuntimeError if no TLS-ok candidates."""
-    passed = [r for r in results if r.get("tls_ok")]
+    passed = [r for r in results if _passed(r)]
     if not passed:
         failing = [r["id"] for r in results]
         raise RuntimeError(
-            f"All {len(failing)} probed targets failed TLS: {failing}. "
+            f"All {len(failing)} probed targets failed TLS/ALPN eligibility: {failing}. "
             "Check Exit network connectivity and firewall."
         )
     winner = max(passed, key=_score)
@@ -131,6 +105,10 @@ def pick_winner(
             "measured_rtt_ms": winner.get("rtt_ms"),
             "tls_ok": True,
             "alpn": winner.get("alpn", ""),
+            "tls_version": winner.get("tls_version", ""),
+            "handshake_ms": winner.get("handshake_ms"),
+            "peer_ip": winner.get("peer_ip", ""),
+            "probe_from": "world",
             "timestamp": now,
             "exit_ip": exit_ip,
             "exit_region": exit_region,
@@ -141,15 +119,23 @@ def pick_winner(
     }
 
 
-def write_reality_target(state_dir: Path, report: dict[str, Any]) -> Path:
-    out = state_dir / "reality_target.json"
+def _target_state_path(state_dir: Path, purpose: str) -> Path:
+    if purpose not in {"direct", "chain"}:
+        raise ValueError("target purpose must be 'direct' or 'chain'")
+    return state_dir / ("chain_reality_target.json" if purpose == "chain" else "reality_target.json")
+
+
+def write_reality_target(
+    state_dir: Path, report: dict[str, Any], purpose: str = "direct",
+) -> Path:
+    out = _target_state_path(state_dir, purpose)
     out.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     return out
 
 
-def load_reality_target(state_dir: Path) -> dict[str, Any]:
+def load_reality_target(state_dir: Path, purpose: str = "direct") -> dict[str, Any]:
     """Read state/reality_target.json; raise FileNotFoundError if absent."""
-    p = state_dir / "reality_target.json"
+    p = _target_state_path(state_dir, purpose)
     if not p.exists():
         raise FileNotFoundError(
             f"{p} not found — run 'pipelinectl probe-targets' before 'configure'."

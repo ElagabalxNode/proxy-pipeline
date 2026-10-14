@@ -1,0 +1,159 @@
+---
+# Idempotent and standalone (playbooks/exit_firewall.yml): it can be re-run on a live Exit without
+# touching inbounds. Rules are rebuilt from scratch on every apply (ufw reset), so a rotated
+# bridge IP or a changed controller never leaves stale allows behind. Every change is made
+# between a snapshot and a fresh-SSH check; a failure restores the snapshot.
+
+- name: Require a known firewall action
+  ansible.builtin.assert:
+    that: exit_fw_action in ['apply', 'rollback']
+    fail_msg: "exit_fw_action must be apply or rollback"
+
+- name: Controller IP as the Exit sees it (source of this SSH session)
+  ansible.builtin.shell: echo "${SSH_CONNECTION%% *}"
+  args: { executable: /bin/bash }
+  register: exit_fw_ctl
+  changed_when: false
+  when: exit_fw_action == 'apply'
+
+# Runs before ufw is installed or touched: a missing direct policy, an absent bridge without
+# the explicit direct-only mode, or a malformed address stops the play here.
+- name: Build the firewall plan on the controller
+  ansible.builtin.command:
+    argv: ["{{ ansible_playbook_python }}", "{{ role_path }}/files/firewall_plan.py"]
+    stdin: "{{ exit_fw_plan_options | to_json }}"
+  vars:
+    exit_fw_plan_options:
+      controller_ip: "{{ exit_fw_ctl.stdout | trim }}"
+      bridge_ips: "{{ [exit_fw_bridge_ip | trim] if exit_fw_bridge_ip | trim else [] }}"
+      direct_only: "{{ exit_fw_direct_only | bool }}"
+      direct_policy: "{{ exit_fw_direct_policy }}"
+      direct_cidrs: "{{ exit_fw_direct_cidrs }}"
+      admin_cidrs: "{{ exit_fw_extra_admin_cidrs }}"
+      ssh_world: "{{ exit_fw_ssh_world | bool }}"
+      ssh_port: "{{ exit_fw_ssh_port }}"
+      reality_port: "{{ reality_port | default(443) }}"
+      ss_port: "{{ ss_port | default(8388) }}"
+      chain_port: "{{ chain_port | default(8443) }}"
+  delegate_to: localhost
+  become: false
+  register: exit_fw_plan_run
+  changed_when: false
+  when: exit_fw_action == 'apply'
+
+- name: Install ufw
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+    update_cache: true
+  environment: { DEBIAN_FRONTEND: noninteractive }
+  when: exit_fw_install_package | bool
+
+- name: Install the firewall helper directory
+  ansible.builtin.file:
+    path: "{{ exit_fw_remote_helper | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: Install the firewall helper
+  ansible.builtin.copy:
+    src: firewall_remote.py
+    dest: "{{ exit_fw_remote_helper }}"
+    mode: "0644"
+
+# Resolved before the pre-change snapshot exists, or "latest" would name that snapshot itself.
+- name: Resolve the snapshot to restore
+  ansible.builtin.command:
+    argv: "{{ exit_fw_helper + ['resolve', exit_fw_snapshot] }}"
+  register: exit_fw_target
+  changed_when: false
+  when: exit_fw_action == 'rollback'
+
+- name: Snapshot the current firewall
+  ansible.builtin.command:
+    argv: "{{ exit_fw_helper + ['snapshot'] }}"
+  register: exit_fw_before
+  changed_when: false
+
+- name: Arm the lockout guard (restores the snapshot in {{ exit_fw_safety_seconds }}s unless cancelled)
+  ansible.builtin.command:
+    argv: "{{ exit_fw_helper + ['arm', exit_fw_saved, '--seconds', exit_fw_safety_seconds | string] }}"
+  changed_when: false
+
+- name: Change the firewall under the lockout guard
+  block:
+    - name: Rebuild ufw rules from the plan
+      ansible.builtin.command:
+        argv: "{{ exit_fw_helper + ['apply'] }}"
+        stdin: "{{ {'rules': (exit_fw_plan_run.stdout | from_json).rules} | to_json }}"
+      changed_when: false
+      when: exit_fw_action == 'apply'
+
+    - name: Restore the requested snapshot
+      ansible.builtin.command:
+        argv: "{{ exit_fw_helper + ['restore', (exit_fw_target.stdout | from_json).snapshot] }}"
+      register: exit_fw_restored
+      changed_when: false
+      when: exit_fw_action == 'rollback'
+
+    - name: A FRESH SSH session from the controller must still get in through the new rules
+      ansible.builtin.command: >
+        ssh -i {{ ansible_ssh_private_key_file }} -p {{ exit_fw_ssh_port }}
+        -o StrictHostKeyChecking=no -o BatchMode=yes
+        -o ConnectTimeout=15 -o ControlPath=none {{ ansible_user }}@{{ ansible_host }} true
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      register: exit_fw_fresh_ssh
+      retries: 3
+      delay: "{{ exit_fw_fresh_ssh_delay }}"
+      until: exit_fw_fresh_ssh.rc == 0
+
+    - name: Verify default deny for IPv4 and IPv6
+      ansible.builtin.command:
+        argv: "{{ exit_fw_helper + ['verify'] }}"
+      register: exit_fw_verified
+      changed_when: false
+      when: exit_fw_action == 'apply'
+  rescue:
+    # If this session is gone too, the armed guard performs the same restore on WORLD.
+    - name: Restore the firewall saved before this change
+      ansible.builtin.command:
+        argv: "{{ exit_fw_helper + ['restore', exit_fw_saved] }}"
+
+    - name: Disarm the lockout guard after the restore
+      ansible.builtin.command:
+        argv: "{{ exit_fw_helper + ['disarm'] }}"
+
+    - name: Drop the snapshot of the failed attempt
+      ansible.builtin.command:
+        argv: "{{ exit_fw_helper + ['discard', exit_fw_saved] }}"
+
+    - name: Report the failed firewall change
+      ansible.builtin.fail:
+        msg: >-
+          WORLD firewall {{ exit_fw_action }} failed at "{{ ansible_failed_task.name }}";
+          the previous rules were restored.
+          {{ ansible_failed_result.stderr | default('') | truncate(300) }}
+
+- name: Disarm the lockout guard
+  ansible.builtin.command:
+    argv: "{{ exit_fw_helper + ['disarm'] }}"
+  changed_when: false
+
+# An apply keeps its pre-change snapshot only if the rules really changed, so repeated configure
+# runs do not bury the last different firewall. A rollback never records itself: repeating it
+# restores the same snapshot again.
+- name: Record the pre-change snapshot
+  ansible.builtin.command:
+    argv: "{{ exit_fw_helper + (['commit', exit_fw_saved] if exit_fw_action == 'apply' else ['discard', exit_fw_saved]) }}"
+  register: exit_fw_recorded
+  changed_when: exit_fw_action == 'rollback' or (exit_fw_recorded.stdout | from_json).changed
+
+- name: Firewall in effect
+  ansible.builtin.debug:
+    msg:
+      action: "{{ exit_fw_action }}"
+      policy: "{{ (exit_fw_plan_run.stdout | from_json).summary if exit_fw_action == 'apply' else (exit_fw_restored.stdout | from_json) }}"
+      rules: "{{ (exit_fw_verified.stdout | from_json).status if exit_fw_action == 'apply' else [] }}"
+      snapshots: "{{ (exit_fw_recorded.stdout | from_json).snapshots }}"

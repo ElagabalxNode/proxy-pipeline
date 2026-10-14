@@ -1,0 +1,103 @@
+---
+# HTTPS front of the XHTTP entry: nginx terminates TLS for the bridge's own name on the public
+# port and passes one secret path to Xray on loopback. Everything here is installed and
+# validated while Xray still serves the old config; taking the port over and going back are
+# steps of the apply.yml transaction.
+- name: Require a consistent HTTPS entry
+  ansible.builtin.assert:
+    that:
+      - bridge_xhttp_enabled
+      - bridge_xhttp_mode in ['auto', 'stream-up', 'packet-up']
+      - bridge_https_domain is match('^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$')
+      - bridge_https_cert | length > 0 and bridge_https_key | length > 0
+      - (bridge_reality_port | default(443) | int) not in [bridge_https_port | int, bridge_https_http_port | int]
+      - bridge_https_site_names is sequence and bridge_https_site_names is not string
+      - bridge_https_domain not in bridge_https_site_names
+      - bridge_https_site_names | reject('match', '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$') | list | length == 0
+    fail_msg: >-
+      The HTTPS entry needs bridge_xhttp_enabled, a lower-case host name, a certificate and key on
+      the controller, and the RAW/REALITY inbound moved off the HTTPS ports.
+
+# policy_rc_d keeps the package from starting its default site on port 80.
+- name: Install nginx without starting it
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+    policy_rc_d: 101
+  environment: { DEBIAN_FRONTEND: noninteractive }
+  when: bridge_https_install_package | bool
+
+- name: Directories of the HTTPS entry
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ bridge_https_dir }}", mode: "0700" }
+    - { path: "{{ bridge_https_webroot }}", mode: "0755" }
+    - { path: "{{ bridge_https_temp_dir }}", mode: "0755" }
+    - { path: "{{ bridge_https_log_dir }}", mode: "0755" }
+
+- name: Throwaway certificate shown to requests that do not name the bridge
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -x509
+      - -newkey
+      - ec
+      - -pkeyopt
+      - ec_paramgen_curve:prime256v1
+      - -nodes
+      - -days
+      - "3650"
+      - -subj
+      - /CN=localhost
+      - -keyout
+      - "{{ bridge_https_dir }}/default.key"
+      - -out
+      - "{{ bridge_https_dir }}/default.crt"
+    creates: "{{ bridge_https_dir }}/default.crt"
+
+- name: Deliver the certificate and its key from the controller
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ bridge_https_dir }}/{{ item.name }}"
+    mode: "0600"
+    backup: true
+  loop:
+    - { src: "{{ bridge_https_cert }}", name: fullchain.pem }
+    - { src: "{{ bridge_https_key }}", name: privkey.pem }
+  loop_control:
+    label: "{{ item.name }}"
+  register: bridge_https_files
+  no_log: true
+  diff: false
+
+- name: Page served to everything except the secret path
+  ansible.builtin.template:
+    src: site-index.html.j2
+    dest: "{{ bridge_https_webroot }}/index.html"
+    mode: "0644"
+  when: bridge_https_site_dir | length == 0
+
+- name: Operator's own static site
+  ansible.builtin.copy:
+    src: "{{ bridge_https_site_dir | regex_replace('/*$', '') }}/"
+    dest: "{{ bridge_https_webroot }}/"
+    mode: "0644"
+    directory_mode: "0755"
+  when: bridge_https_site_dir | length > 0
+
+# `nginx -t` loads the certificate and key too: a pair that does not match fails here, while
+# Xray still holds the port and clients are unaffected.
+- name: Validate and install the nginx configuration
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: "{{ bridge_https_conf }}"
+    mode: "0644"
+    validate: "{{ bridge_https_binary }} -t -c %s"
+    backup: true
+  register: bridge_https_conf_result
+  diff: false

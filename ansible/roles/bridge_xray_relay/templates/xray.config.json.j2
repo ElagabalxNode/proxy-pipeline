@@ -1,8 +1,8 @@
 {
   "log": {
     "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log"
+    "access": {{ ((bridge_xray_log_dir | default('/var/log/xray')) ~ '/access.log') | to_json }},
+    "error": {{ ((bridge_xray_log_dir | default('/var/log/xray')) ~ '/error.log') | to_json }}
   },
 {# The bridge's own lookups only (client destinations pass through AsIs and are resolved on the
    Exit). What matters here is the Reality dest, dialed on every client handshake: resolve it
@@ -13,7 +13,43 @@
   "dns": {
     "servers": {{ bridge_dns_servers | to_json }}
   },
+{# Every inbound that carries client traffic. All of them, and only them plus the chain probe,
+   are routed to WORLD below; nothing here may ever reach the `direct` outbound. #}
+{% set xhttp_entry = bridge_xhttp_enabled | default(false) %}
+{% set chain_inbounds = ["vless-reality-in", "ss2022-in"] + (["vless-xhttp-in"] if xhttp_entry else []) + ["probe-in"] %}
   "inbounds": [
+{% if xhttp_entry %}
+{# Client entry behind the local HTTPS reverse proxy: TLS ends there, so this listener is
+   loopback-only and plain. XHTTP takes no flow; vision belongs to the RAW profile only. #}
+    {
+      "tag": "vless-xhttp-in",
+      "listen": "127.0.0.1",
+      "port": {{ bridge_xhttp_port | int }},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "{{ bridge_xhttp_uuid }}",
+            "flow": "",
+            "email": "client-xhttp"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "none",
+        "xhttpSettings": {
+          "mode": {{ bridge_xhttp_mode | default('auto') | to_json }},
+          "path": {{ bridge_xhttp_path | to_json }}
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    },
+{% endif %}
     {
       "tag": "vless-reality-in",
       "listen": "0.0.0.0",
@@ -62,7 +98,7 @@
       }
     },
 {# Loopback-only SOCKS inbounds for chain-probe.sh (never reachable from outside):
-   probe-in        -> default route -> chain-to-exit -> Exit -> internet (the whole chain)
+   probe-in        -> explicit route -> chain-to-exit -> Exit -> internet (the whole chain)
    probe-direct-in -> routed to `direct` below: the bridge's own egress, no Exit (reference) #}
     {
       "tag": "probe-in",
@@ -80,6 +116,12 @@
     }
   ],
   "outbounds": [
+{# Unmatched/new inbounds fail closed even if a routing rule is accidentally omitted. #}
+    {
+      "tag": "block",
+      "protocol": "blackhole",
+      "settings": {}
+    },
 {% if bridge_chain_mode == "ss" %}
     {
       "tag": "chain-to-exit",
@@ -127,7 +169,7 @@
         },
         "xhttpSettings": {
           "mode": "auto",
-          "path": "/chain-relay"
+          "path": {{ chain_path | default('/chain-relay') | to_json }}
         }
       }
     },
@@ -135,11 +177,6 @@
     {
       "tag": "direct",
       "protocol": "freedom",
-      "settings": {}
-    },
-    {
-      "tag": "block",
-      "protocol": "blackhole",
       "settings": {}
     }
   ],
@@ -153,8 +190,9 @@
       },
       {
         "type": "field",
-        "outboundTag": "direct",
-        "ip": ["geoip:private"]
+        "outboundTag": "block",
+        "ip": ["geoip:private"],
+        "inboundTag": {{ chain_inbounds | to_json }}
       },
       {
         "type": "field",
@@ -164,7 +202,7 @@
       {
         "type": "field",
         "outboundTag": "chain-to-exit",
-        "port": "0-65535"
+        "inboundTag": {{ chain_inbounds | to_json }}
       }
     ]
   }

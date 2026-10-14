@@ -39,6 +39,28 @@ variable "ssh_public_key_path" {
   default = "~/.ssh/proxy_pipeline.pub"
 }
 
+# 3X-UI on a new Exit is installed from this exact release and nothing else. No default: an
+# unpinned Exit is refused at plan time, before the old one is replaced.
+variable "xui_version" {
+  description = "3X-UI release tag installed on a new Exit, e.g. v2.6.0"
+  type        = string
+
+  validation {
+    condition     = can(regex("^v[0-9]+\\.[0-9]+\\.[0-9]+$", var.xui_version))
+    error_message = "Set xui_version to an exact release tag (vX.Y.Z); 'latest' is not a pin."
+  }
+}
+
+variable "xui_archive_sha256" {
+  description = "SHA256 of x-ui-linux-<arch>.tar.gz of that release for the Exit architecture"
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{64}$", var.xui_archive_sha256))
+    error_message = "Set xui_archive_sha256 to the lowercase SHA256 of the release archive."
+  }
+}
+
 variable "panel_port" {
   type    = string
   default = "2053"

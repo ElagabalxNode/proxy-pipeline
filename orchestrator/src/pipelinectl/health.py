@@ -111,14 +111,19 @@ def run_health(
     if bridge_ip and bridge_key:
         ok_b, msg_b = _ssh_ok(bridge_ip, bridge_user, bridge_key, extra_args=[])
         rpt.add(CheckResult("bridge_ssh", ok_b, "error" if not ok_b else "info", msg_b))
-        rpt.add(
-            CheckResult(
-                "tcp_bridge_443",
-                _tcp_open(bridge_ip, 443),
-                "error",
-                f"{bridge_ip}:443",
+        # Client-facing listeners: the RAW/REALITY inbound, and the HTTPS entry when it exists.
+        ports = [int(data.get("bridge_reality_port") or 443)]
+        if data.get("bridge_domain"):
+            ports.append(int(data.get("bridge_https_port") or 443))
+        for port in dict.fromkeys(ports):
+            rpt.add(
+                CheckResult(
+                    f"tcp_bridge_{port}",
+                    _tcp_open(bridge_ip, port),
+                    "error",
+                    f"{bridge_ip}:{port}",
+                )
             )
-        )
         if ok_b:
             chain_port = int(data.get("chain_port", 8443))
             remote_cmd = f"timeout 6 bash -c 'echo >/dev/tcp/{exit_ip}/{chain_port}'"

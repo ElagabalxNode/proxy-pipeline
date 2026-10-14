@@ -1,0 +1,5 @@
+# Managed by Ansible (proxy-pipeline, role bridge_xray_relay). See defaults: bridge_dns_servers.
+# Domains=~. makes these servers preferred for every lookup, over the per-link DHCP servers.
+[Resolve]
+DNS={{ bridge_dns_servers | reject('equalto', 'localhost') | join(' ') }}
+Domains=~.

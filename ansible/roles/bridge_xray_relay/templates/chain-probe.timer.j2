@@ -1,0 +1,10 @@
+[Unit]
+Description=proxy-pipeline chain probe every {{ chain_probe_interval }}
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec={{ chain_probe_interval }}
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

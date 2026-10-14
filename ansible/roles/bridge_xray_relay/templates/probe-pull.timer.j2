@@ -1,0 +1,10 @@
+[Unit]
+Description=proxy-pipeline: pull chain-probe log every {{ chain_probe_pull_interval }}
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec={{ chain_probe_pull_interval }}
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

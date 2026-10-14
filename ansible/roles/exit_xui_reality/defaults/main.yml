@@ -3,6 +3,16 @@ panel_pass: ""
 panel_port: "2053"
 panel_user: admin
 panel_path: /secretpanel
+panel_bootstrap: false
+world_database: /etc/x-ui/x-ui.db
+world_remote_helper: /usr/local/libexec/proxy-pipeline/world_remote.py
+world_xray_binary: ""  # otherwise require exactly one /usr/local/x-ui/bin/xray-linux-*
+world_panel_binary: /usr/local/x-ui/x-ui
+# Pinned WORLD release, supplied by pipelinectl configure from xray.world_release. There is no
+# default: the role refuses an unpinned node and never upgrades or accepts a different build.
+world_xui_version: ""
+world_xray_version: ""
+world_xray_sha256: ""
 # reality_sni and reality_dest MUST be supplied by pipelinectl configure (from state/reality_target.json).
 # There is no default: configure fails if probe-targets has not been run first.
 reality_sni: ""
@@ -11,3 +21,9 @@ reality_port: 443
 ss_port: 8388
 ss_method: 2022-blake3-aes-128-gcm
 chain_port: 8443
+# Chain REALITY identity. A new WORLD always gets its own chain key/shortId. An existing one
+# keeps what it serves; world_separate_chain is the explicit migration that gives the chain its
+# own key/shortId (if still shared with direct) and the probed chain target below.
+world_separate_chain: false
+chain_reality_sni: ""
+chain_reality_dest: ""

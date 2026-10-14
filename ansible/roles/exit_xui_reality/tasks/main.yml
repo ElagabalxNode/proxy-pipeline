@@ -46,276 +46,75 @@
     panel_ui_path: >-
       {{ '/' if panel_path_clean == '' else '/' ~ panel_path_clean ~ '/' }}
 
-- name: Discover x-ui binary
-  ansible.builtin.shell: |
-    set -euo pipefail
-    if [ -x /usr/local/x-ui/x-ui ]; then
-      echo /usr/local/x-ui/x-ui
-    else
-      echo "MISSING"
-    fi
-  args:
-    executable: /bin/bash
-  register: xui_bin_path
-  changed_when: false
-
-- name: Fail if x-ui not found
-  ansible.builtin.fail:
-    msg: "3X-UI binary not found on Exit (/usr/local/x-ui/x-ui missing)"
-  when: xui_bin_path.stdout is search("MISSING")
-
-# 3X-UI 3.x (React-SPA rewrite) moved/removed the /panel/setting/* HTTP API and now
-# requires a CSRF token on every POST. The `x-ui setting` CLI is stable across versions,
-# so panel port/path/admin-credentials are set via the CLI (no auth, no CSRF, deterministic
-# regardless of the random creds a fresh install generates), then we only use the HTTP API
-# (with CSRF) for what the CLI can't do: creating inbounds.
-- name: Configure panel (port, web base path, admin credentials) via x-ui CLI
-  ansible.builtin.command:
-    argv:
-      - "{{ xui_bin_path.stdout | trim }}"
-      - setting
-      - -username
-      - "{{ panel_user }}"
-      - -password
-      - "{{ panel_pass }}"
-      - -port
-      - "{{ panel_port }}"
-      - -webBasePath
-      - "{{ panel_web_base_path }}"
-  register: xui_settings
-  changed_when: true
-  no_log: true
-
-- name: Restart x-ui to apply settings
-  ansible.builtin.service:
-    name: x-ui
-    state: restarted
-
-- name: Discover xray binary for x25519
-  ansible.builtin.shell: |
-    set -euo pipefail
-    if ls /usr/local/x-ui/bin/xray-linux-* 1>/dev/null 2>&1; then
-      ls /usr/local/x-ui/bin/xray-linux-* | head -1
-    elif command -v xray >/dev/null 2>&1; then
-      command -v xray
-    else
-      echo "MISSING"
-    fi
-  args: { executable: /bin/bash }
-  register: xray_bin_path
-  changed_when: false
-
-- name: Fail if xray not found
-  ansible.builtin.fail:
-    msg: "xray binary not found on Exit (3X-UI install incomplete)"
-  when: xray_bin_path.stdout is search("MISSING")
-
-- name: Generate Reality x25519 keypair
-  ansible.builtin.command: "{{ xray_bin_path.stdout | trim }} x25519"
-  register: x25519_out
-  changed_when: false
-
-- name: Normalize x25519 output to JSON
-  ansible.builtin.shell: |
-    set -euo pipefail
-    XRAY_OUTPUT=$(cat <<'EOF'
-    {{ x25519_out.stdout }}
-    EOF
-    )
-    XRAY_OUTPUT="$XRAY_OUTPUT" python3 - <<'PY'
-    import json
-    import os
-    import re
-
-    output = os.environ.get("XRAY_OUTPUT", "")
-
-    def extract(pattern: str) -> str:
-        match = re.search(pattern, output, flags=re.MULTILINE | re.IGNORECASE)
-        return match.group(1).strip() if match else ""
-
-    payload = {
-        "private_key": extract(r"^Private(?:Key)?\s*:\s*(\S+)"),
-        "public_key": extract(r"^(?:Public(?:\s+Key)?|Password(?:\s+\(PublicKey\))?)\s*:\s*(\S+)"),
-        "raw": output,
-    }
-
-    print(json.dumps(payload))
-    PY
-  args:
-    executable: /bin/bash
-  register: x25519_parsed
-  changed_when: false
-
-- name: Parse x25519 keys
-  ansible.builtin.set_fact:
-    reality_private_key: "{{ (x25519_parsed.stdout | from_json).private_key | default('') }}"
-    reality_public_key: "{{ (x25519_parsed.stdout | from_json).public_key | default('') }}"
-
-- name: Fail if keys empty
-  ansible.builtin.fail:
-    msg: "Could not parse x25519 output: {{ (x25519_parsed.stdout | from_json).raw | default(x25519_out.stdout | default('')) }}"
-  when: reality_private_key | length < 10 or reality_public_key | length < 10
-
-- name: Generate identifiers
-  ansible.builtin.set_fact:
-    vless_uuid: "{{ lookup('pipe', 'cat /proc/sys/kernel/random/uuid') }}"
-    reality_short_id: "{{ lookup('pipe', 'openssl rand -hex 4') }}"
-    ss_password: "{{ lookup('pipe', 'openssl rand -base64 18 | tr -d \"\\n\"') }}"
-    chain_uuid: "{{ lookup('pipe', 'cat /proc/sys/kernel/random/uuid') }}"
-
-- name: Ensure state directory on controller
+- name: Install WORLD SSH helper
   ansible.builtin.file:
-    path: "{{ pipeline_state_dir }}"
+    path: "{{ world_remote_helper | dirname }}"
     state: directory
-    mode: "0700"
-  delegate_to: localhost
-  run_once: true
+    mode: "0755"
 
-- name: Write cookie jar path fact
+- name: Copy WORLD SSH helper
+  ansible.builtin.copy:
+    src: world_remote.py
+    dest: "{{ world_remote_helper }}"
+    mode: "0644"
+
+- name: Discover the bundled Xray binary
+  ansible.builtin.find:
+    paths: /usr/local/x-ui/bin
+    patterns: xray-linux-*
+    file_type: file
+  register: world_binaries
+
+- name: Require one bundled Xray binary (or an explicit override)
+  ansible.builtin.assert:
+    that: world_xray_binary != '' or world_binaries.matched == 1
+    fail_msg: "Cannot uniquely identify the installed WORLD Xray; set world_xray_binary explicitly"
+
+- name: Select installed WORLD Xray
   ansible.builtin.set_fact:
-    cookie_jar: "{{ pipeline_state_dir }}/.3x-ui-cookies.txt"
+    world_binary: "{{ world_xray_binary or world_binaries.files[0].path }}"
 
-- name: Wait for configured panel port
+- name: Verify the pinned WORLD release
+  ansible.builtin.include_tasks: release.yml
+
+# Bootstrap is explicit and only permitted on an empty local SQLite panel. Existing
+# panels must already authenticate with the configured credentials/path: never reset
+# them, or restart x-ui, just because a login failed.
+- name: Bootstrap a fresh panel only when requested
+  when: panel_bootstrap | bool
+  block:
+    - name: Verify empty SQLite panel and save a consistent database backup
+      ansible.builtin.command:
+        argv: [python3, "{{ world_remote_helper }}"]
+        stdin: "{{ {'action': 'bootstrap', 'binary': world_binary, 'database': world_database} | to_json }}"
+      register: world_bootstrap_snapshot
+      changed_when: true
+
+    - name: Configure fresh panel credentials and path
+      ansible.builtin.command:
+        argv:
+          - /usr/local/x-ui/x-ui
+          - setting
+          - -username
+          - "{{ panel_user }}"
+          - -password
+          - "{{ panel_pass }}"
+          - -port
+          - "{{ panel_port }}"
+          - -webBasePath
+          - "{{ panel_web_base_path }}"
+      no_log: true
+
+    - name: Start the bootstrapped panel
+      ansible.builtin.systemd:
+        name: x-ui
+        state: restarted
+
+- name: Wait for the local panel listener
   ansible.builtin.wait_for:
-    host: "{{ ansible_host }}"
+    host: 127.0.0.1
     port: "{{ panel_port | int }}"
     timeout: 120
-  delegate_to: localhost
-  run_once: true
 
-# 3X-UI 3.x serves a CSRF token at {base}/csrf-token (JSON: {"obj": "<token>", ...}) and
-# rejects any POST without the X-CSRF-Token header (HTTP 403). The token is bound to the
-# session cookie, so we keep one cookie jar across login + inbound creation, and fetch a
-# fresh token (with the current cookie) immediately before each POST.
-- name: Login to 3X-UI (CSRF-aware)
-  ansible.builtin.shell: |
-    set -euo pipefail
-    rm -f "{{ cookie_jar }}"
-    BASE="http://{{ ansible_host }}:{{ panel_port }}{{ panel_request_prefix }}"
-    CSRF=$(curl -sS -c "{{ cookie_jar }}" "$BASE/csrf-token" \
-      | python3 -c 'import json,sys; print(json.load(sys.stdin)["obj"])')
-    curl -sS -b "{{ cookie_jar }}" -c "{{ cookie_jar }}" -X POST \
-      -H "Content-Type: application/x-www-form-urlencoded" \
-      -H "X-CSRF-Token: $CSRF" \
-      --data-urlencode "username={{ panel_user }}" \
-      --data-urlencode "password={{ panel_pass }}" \
-      "$BASE/login" \
-      | tee "{{ pipeline_state_dir }}/.login-final.json"
-    python3 - <<'PY'
-    import json
-    d=json.load(open("{{ pipeline_state_dir }}/.login-final.json"))
-    assert d.get("success") is True, d
-    PY
-  args:
-    executable: /bin/bash
-  register: final_panel_login
-  retries: 12
-  delay: 5
-  until: final_panel_login.rc == 0
-  delegate_to: localhost
-  run_once: true
-  no_log: true
-
-- name: Build inbound JSON payloads (jq)
-  ansible.builtin.shell: |
-    set -euo pipefail
-    case "{{ item.name }}" in
-      vless_reality)
-        jq -n \
-          --arg uuid "{{ vless_uuid }}" \
-          --arg pk "{{ reality_private_key }}" \
-          --arg sni "{{ reality_sni }}" \
-          --arg dest "{{ reality_dest }}" \
-          --arg sid "{{ reality_short_id }}" \
-          --argjson sniff '{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}' \
-          --argjson port {{ reality_port | int }} \
-          '{
-            up:0, down:0, total:0, remark:"VLESS-Reality-Vision", enable:true, expiryTime:0, listen:"",
-            port: $port, protocol:"vless",
-            settings: ({clients:[{id:$uuid,flow:"xtls-rprx-vision",email:"main",limitIp:0,totalGB:0,expiryTime:0,enable:true,subId:"main"}],decryption:"none",fallbacks:[]} | tostring),
-            streamSettings: ({network:"tcp",security:"reality",realitySettings:{show:false,xver:0,dest:$dest,serverNames:[$sni],privateKey:$pk,shortIds:[$sid]},tcpSettings:{acceptProxyProtocol:false,header:{type:"none"}}} | tostring),
-            sniffing: ($sniff | tostring)
-          }' > "{{ pipeline_state_dir }}/.payload-{{ item.name }}.json"
-        ;;
-      shadowsocks2022)
-        jq -n \
-          --arg method "{{ ss_method }}" \
-          --arg pass "{{ ss_password }}" \
-          --argjson sniff '{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}' \
-          --argjson port {{ ss_port | int }} \
-          '{
-            up:0, down:0, total:0, remark:"SS2022-Fallback", enable:true, expiryTime:0, listen:"",
-            port: $port, protocol:"shadowsocks",
-            settings: ({method:$method,password:$pass,network:"tcp,udp",clients:[]} | tostring),
-            streamSettings: ({"network":"tcp","security":"none","tcpSettings":{"acceptProxyProtocol":false,"header":{"type":"none"}}} | tostring),
-            sniffing: ($sniff | tostring)
-          }' > "{{ pipeline_state_dir }}/.payload-{{ item.name }}.json"
-        ;;
-      chain_xhttp)
-        jq -n \
-          --arg uuid "{{ chain_uuid }}" \
-          --arg pk "{{ reality_private_key }}" \
-          --arg sni "{{ reality_sni }}" \
-          --arg dest "{{ reality_dest }}" \
-          --arg sid "{{ reality_short_id }}" \
-          --argjson sniff '{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}' \
-          --argjson port {{ chain_port | int }} \
-          '{
-            up:0, down:0, total:0, remark:"Chain-Bridge-Entry", enable:true, expiryTime:0, listen:"",
-            port: $port, protocol:"vless",
-            settings: ({clients:[{id:$uuid,flow:"",email:"bridge-relay",limitIp:0,totalGB:0,expiryTime:0,enable:true,subId:"bridge"}],decryption:"none",fallbacks:[]} | tostring),
-            streamSettings: ({network:"xhttp",security:"reality",realitySettings:{show:false,xver:0,dest:$dest,serverNames:[$sni],privateKey:$pk,shortIds:[$sid]},xhttpSettings:{mode:"auto",path:"/chain-relay"}} | tostring),
-            sniffing: ($sniff | tostring)
-          }' > "{{ pipeline_state_dir }}/.payload-{{ item.name }}.json"
-        ;;
-    esac
-  args: { executable: /bin/bash }
-  loop:
-    - { name: vless_reality }
-    - { name: shadowsocks2022 }
-    - { name: chain_xhttp }
-  delegate_to: localhost
-  run_once: true
-
-- name: Submit inbounds to 3X-UI (CSRF-aware)
-  ansible.builtin.shell: |
-    set -euo pipefail
-    BASE="http://{{ ansible_host }}:{{ panel_port }}{{ panel_request_prefix }}"
-    CSRF=$(curl -sS -b "{{ cookie_jar }}" -c "{{ cookie_jar }}" "$BASE/csrf-token" \
-      | python3 -c 'import json,sys; print(json.load(sys.stdin)["obj"])')
-    curl -sS -b "{{ cookie_jar }}" -H "Content-Type: application/json" \
-      -H "X-CSRF-Token: $CSRF" \
-      -d @"{{ pipeline_state_dir }}/.payload-{{ item.name }}.json" \
-      "$BASE/panel/api/inbounds/add" \
-      | tee "{{ pipeline_state_dir }}/.inbound-{{ item.name }}.resp.json"
-    python3 - <<'PY'
-    import json
-    d=json.load(open("{{ pipeline_state_dir }}/.inbound-{{ item.name }}.resp.json"))
-    assert d.get("success") is True, d
-    PY
-  args:
-    executable: /bin/bash
-  loop:
-    - { name: vless_reality }
-    - { name: shadowsocks2022 }
-    - { name: chain_xhttp }
-  delegate_to: localhost
-  run_once: true
-
-- name: Render runtime state for Bridge and tools
-  ansible.builtin.template:
-    src: runtime.json.j2
-    dest: "{{ pipeline_state_dir }}/runtime.json"
-    mode: "0600"
-  delegate_to: localhost
-  run_once: true
-
-- name: Verify listening ports on Exit
-  ansible.builtin.wait_for:
-    host: "{{ ansible_host }}"
-    port: "{{ item }}"
-    timeout: 120
-  loop:
-    - "{{ reality_port | int }}"
-    - "{{ ss_port | int }}"
-    - "{{ chain_port | int }}"
+- name: Configure WORLD inbounds transaction
+  ansible.builtin.include_tasks: transaction.yml

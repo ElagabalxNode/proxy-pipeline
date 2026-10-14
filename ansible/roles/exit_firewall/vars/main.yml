@@ -1,0 +1,8 @@
+exit_fw_helper:
+  - "{{ exit_fw_python }}"
+  - "{{ exit_fw_remote_helper }}"
+  - --state
+  - "{{ exit_fw_state_dir }}"
+  - --root
+  - "{{ exit_fw_root }}"
+exit_fw_saved: "{{ (exit_fw_before.stdout | from_json).snapshot }}"

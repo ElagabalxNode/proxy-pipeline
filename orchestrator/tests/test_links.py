@@ -90,3 +90,67 @@ def test_bridge_links_fall_back_to_exit_fields_for_old_state(tmp_path: Path) -> 
         m["bridge_shadowsocks"]
         == f"ss://{_ss_userinfo(EXIT['ss_method'], 'exit-ss-pass')}@198.51.100.5:8388#Bridge-SS2022-198.51.100.5"
     )
+
+
+# ── main profile: VLESS + XHTTP + TLS to the bridge's own name ─────────────────────
+
+HTTPS_BRIDGE = {
+    **BRIDGE,
+    "bridge_reality_port": 8443,
+    "bridge_domain": "lk.example.ru",
+    "bridge_https_port": 443,
+    "bridge_xhttp_uuid": "xhttp-uuid",
+    "bridge_xhttp_path": "/a1b2c3d4e5f6",
+    "bridge_xhttp_mode": "stream-up",
+}
+CHAIN_SECRETS = {
+    "chain_uuid": "chain-uuid-secret",
+    "chain_public_key": "chain-pbk-secret",
+    "chain_private_key": "chain-private-secret",
+    "chain_short_id": "c0ffee00",
+    "chain_reality_sni": "chain-target.example",
+    "chain_path": "/chain-relay-secret",
+}
+
+
+def test_xhttp_link_addresses_the_domain_and_carries_no_flow_or_chain_secrets(tmp_path: Path) -> None:
+    m = _links(tmp_path, {**EXIT, **CHAIN_SECRETS}, HTTPS_BRIDGE)
+    link = m["bridge_xhttp"]
+    assert link == (
+        "vless://xhttp-uuid@lk.example.ru:443?encryption=none&security=tls&sni=lk.example.ru&alpn=h2"
+        "&fp=firefox&type=xhttp&host=lk.example.ru&path=%2Fa1b2c3d4e5f6&mode=stream-up"
+        "#Bridge-XHTTP-lk.example.ru"
+    )
+    assert "flow" not in link and "198.51.100.5" not in link and "reality" not in link
+    everything = json.dumps(m)
+    for secret in CHAIN_SECRETS.values():
+        assert secret not in everything
+    # The RAW/REALITY profile stays available as a reserve, on the port it was moved to.
+    assert m["bridge_vless"].startswith("vless://bridge-uuid@198.51.100.5:8443?")
+    assert "flow=xtls-rprx-vision" in m["bridge_vless"]
+
+
+def test_xhttp_link_survives_exit_rotation_and_a_new_bridge_address(tmp_path: Path) -> None:
+    before = _links(tmp_path, EXIT, HTTPS_BRIDGE)["bridge_xhttp"]
+    rotated = {**EXIT, "exit_ip": "203.0.113.99", "uuid": "new", "public_key": "new-pbk",
+               "chain_uuid": "new-chain", "reality_sni": "other.example.net"}
+    moved = {**HTTPS_BRIDGE, "bridge_ip": "198.51.100.77"}  # DNS follows; the link must not change
+    assert _links(tmp_path, rotated, moved)["bridge_xhttp"] == before
+
+
+def test_no_xhttp_link_without_a_complete_https_entry(tmp_path: Path) -> None:
+    assert "bridge_xhttp" not in _links(tmp_path, EXIT, BRIDGE)
+    partial = {k: v for k, v in HTTPS_BRIDGE.items() if k != "bridge_xhttp_path"}
+    assert "bridge_xhttp" not in _links(tmp_path, EXIT, partial)
+
+
+def test_export_lists_the_https_profile_first_and_marks_the_reserve(tmp_path: Path) -> None:
+    (tmp_path / "runtime.json").write_text(json.dumps(EXIT), encoding="utf-8")
+    (tmp_path / "bridge_runtime.json").write_text(json.dumps(HTTPS_BRIDGE), encoding="utf-8")
+    text = links.export_client_links(tmp_path, tmp_path, write_file=False)
+    assert text.index("HTTPS + XHTTP (main profile)") < text.index("RAW/REALITY and SS2022 (reserve)")
+    exported = json.loads(links.export_client_links(tmp_path, tmp_path, fmt="json", write_file=False))
+    assert exported["bridge_xhttp"].startswith("vless://xhttp-uuid@lk.example.ru:443?")
+    (tmp_path / "bridge_runtime.json").write_text(json.dumps(BRIDGE), encoding="utf-8")
+    plain = links.export_client_links(tmp_path, tmp_path, write_file=False)
+    assert "# THROUGH BRIDGE\n" in plain and "reserve" not in plain

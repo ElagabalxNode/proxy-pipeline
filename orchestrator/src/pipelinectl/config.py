@@ -42,6 +42,14 @@ def bridge_ssh_user(cfg: dict[str, Any]) -> str:
     return str(cfg.get("ssh", {}).get("bridge_user", "ubuntu"))
 
 
+def manual_bridge(cfg: dict[str, Any]) -> dict[str, str]:
+    """RU bridge outside Terraform (`bridge_manual` in config): {"ip", "ssh_user"}, or {}."""
+    section = cfg.get("bridge_manual") or {}
+    if not isinstance(section, dict) or not str(section.get("ip") or "").strip():
+        return {}
+    return {"ip": str(section["ip"]).strip(), "ssh_user": str(section.get("ssh_user") or "root").strip()}
+
+
 def panel_pass(cfg: dict[str, Any]) -> str:
     v = os.environ.get("PROXY_PIPELINE_PANEL_PASS") or str(cfg.get("panel", {}).get("pass", ""))
     return v

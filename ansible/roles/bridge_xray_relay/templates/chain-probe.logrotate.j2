@@ -1,0 +1,9 @@
+{{ chain_probe_log }} {
+    daily
+    rotate {{ chain_probe_keep_days }}
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
