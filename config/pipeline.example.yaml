@@ -82,7 +82,11 @@ xray:
 bridge_manual:
   ip: ""
   ssh_user: root
-  provider: ""               # label for `pipelinectl status`, e.g. VDSina
+  # VDSina = `rotate bridge` orders and checks a new server through the API (VDSINA_API_TOKEN);
+  # any other value is a label, and a new server is given with --bridge-ip.
+  provider: ""
+  # VDSina only, optional: what to order instead of a copy of the current server.
+  # vdsina: {datacenter: 3, server-plan: 136, template: 36}
 
 # HTTPS entry of the bridge: nginx on RU:443 with your own name and certificate, the VLESS +
 # XHTTP client entry behind it on loopback. Empty domain = off, the bridge works as before.

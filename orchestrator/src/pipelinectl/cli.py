@@ -14,6 +14,7 @@ from pipelinectl import (
     alerts,
     ansible_runner,
     backup,
+    bridge_rotate,
     certs,
     chainlog,
     cherry,
@@ -23,11 +24,13 @@ from pipelinectl import (
     inventory,
     iprep,
     links,
+    menu,
     paths,
     probe,
     status,
     terraform,
     timeweb_dns,
+    vdsina,
     watchdog,
     world_release,
 )
@@ -919,9 +922,16 @@ def status_cmd(
     parts = status.diagnose(
         rpt.results, reach, providers,
         declared_bridge=config.manual_bridge(cfg).get("ip", ""), recorded_bridge=bridge_ip,
+        bridge_automatic=_bridge_kind(cfg) in ("vdsina", "yandex"),
     )
     typer.echo(status.render(parts, note))
     raise typer.Exit(sum(not p.ok for p in parts))
+
+
+@app.command("menu")
+def menu_cmd() -> None:
+    """Interactive menu: status, the chain, checks, links, node replacement, settings."""
+    menu.run_menu()
 
 
 @app.command("backup")
@@ -1390,8 +1400,20 @@ def rotate(
     bridge_ip: str = typer.Option(
         None, "--bridge-ip", help="bridge: move the manual (non-Terraform) bridge to this new server"
     ),
+    attempts: int = typer.Option(3, "--attempts", help="bridge on VDSina: servers to try before giving up"),
+    delete_old: bool = typer.Option(
+        False, "--delete-old", help="bridge on VDSina: delete the old server after a successful move"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="bridge on VDSina: show what would be ordered, change nothing"
+    ),
 ) -> None:
     """Recreate Exit and/or Bridge and re-issue links, via scripts/rotate-chain.sh.
+
+    `rotate bridge` picks the tool from how the bridge is run: a Yandex bridge in Terraform is
+    recreated by Terraform; a VDSina bridge (bridge_manual.provider: VDSina) gets a new server
+    through the VDSina API, checked from inside and outside before anything moves; any other
+    manual bridge needs --bridge-ip of a server you created.
 
     The bridge keeps its reserved IP and identity, so the client QR survives every rotation
     unless --new-ip explicitly asks for a new address.
@@ -1409,6 +1431,23 @@ def rotate(
     if not script.exists():
         typer.secho(f"rotation script not found: {script}", fg=typer.colors.RED)
         raise typer.Exit(1)
+    if t == "bridge" and not bridge_ip:
+        cfg = _cfg()
+        kind = _bridge_kind(cfg)
+        typer.echo(f"[rotate] bridge is run by: {kind}")
+        if kind == "vdsina":
+            raise typer.Exit(_rotate_vdsina_bridge(cfg, script, attempts, yes, delete_old, dry_run))
+        if kind == "manual":
+            typer.secho("this bridge's provider has no API here: create a new RU server with the controller's"
+                        " SSH key, then run: pipelinectl rotate bridge --bridge-ip NEW_IP", fg=typer.colors.RED)
+            raise typer.Exit(2)
+        if kind == "none":
+            typer.secho("no bridge: neither a Yandex bridge in Terraform nor bridge_manual in config",
+                        fg=typer.colors.RED)
+            raise typer.Exit(2)
+        if dry_run:
+            typer.echo("[rotate] dry-run: the Yandex bridge would be recreated by Terraform")
+            raise typer.Exit(0)
     cmd = ["bash", str(script), t]
     if region:
         cmd += ["--region", region]
@@ -1421,6 +1460,95 @@ def rotate(
     if bridge_ip:
         cmd += ["--bridge-ip", bridge_ip.strip()]
     raise typer.Exit(subprocess.call(cmd, cwd=str(paths.repo_root())))
+
+
+def _bridge_kind(cfg: dict) -> str:
+    """yandex (Terraform), vdsina (API), manual (any other server) or none."""
+    try:
+        listed = subprocess.run(
+            ["terraform", f"-chdir={paths.terraform_dir(cfg)}", "state", "list"],
+            capture_output=True, text=True, timeout=120,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        listed = ""
+    if re.search(r"yandex_compute_instance\.bridge$", listed, re.M):
+        return "yandex"
+    manual = cfg.get("bridge_manual") if isinstance(cfg.get("bridge_manual"), dict) else {}
+    if str(manual.get("provider") or "").strip().lower() == "vdsina" and config.manual_bridge(cfg):
+        return "vdsina"
+    return "manual" if config.manual_bridge(cfg) else "none"
+
+
+def _rotate_vdsina_bridge(
+    cfg: dict, script: Path, attempts: int, yes: bool, delete_old: bool, dry_run: bool
+) -> int:
+    """Order a VDSina server that passes every gate, then move the bridge onto it."""
+    def fail(msg: str) -> int:
+        typer.secho(f"[bridge] {msg}", fg=typer.colors.RED)
+        return 1
+
+    auth = vdsina.token()
+    if not auth:
+        return fail("set VDSINA_API_TOKEN in .env (VDSina panel -> account -> API)")
+    request = vdsina.api(auth)
+    st = paths.state_dir(cfg)
+    manual = config.manual_bridge(cfg)
+    data = health.load_runtime(st)
+    domain = str(data.get("bridge_domain") or (cfg.get("bridge_entry") or {}).get("domain") or "")
+    exit_ip, chain_port = str(data.get("exit_ip") or ""), int(data.get("chain_port") or 8443)
+    key = config.ssh_key_for_bridge(cfg)
+    pub = Path(str(key) + ".pub")
+    try:
+        if not (domain and exit_ip):
+            raise ValueError("state has no Exit or no bridge domain: run configure first")
+        cert, privkey = certs.published(st, certs.zone_of(cfg))
+        if not (cert.is_file() and privkey.is_file() and pub.is_file()):
+            raise ValueError(f"need {cert}, {privkey} and {pub}")
+        old = vdsina.find_server(request, manual["ip"])
+        spec = vdsina.spec_of(request, int(old["id"])) if old else {}
+        overrides = (cfg.get("bridge_manual") or {}).get("vdsina") or {}
+        spec.update({k: int(v) for k, v in overrides.items() if k in ("datacenter", "server-plan", "template")})
+        if set(spec) != {"datacenter", "server-plan", "template"}:
+            raise ValueError("old server not found by address: set bridge_manual.vdsina datacenter/server-plan/template")
+        price = vdsina.plan_cost(request, spec["server-plan"]) or "price unknown"
+    except (OSError, ValueError, KeyError, vdsina.ApiError) as e:
+        return fail(str(e))
+    typer.echo(f"[bridge] now: {manual['ip']}" + (f" (VDSina server {old['id']})" if old else ""))
+    typer.echo(f"[bridge] new server: datacenter {spec['datacenter']}, plan {spec['server-plan']} ({price}),"
+               f" template {spec['template']}; up to {attempts} attempt(s), rejected servers deleted at once")
+    typer.echo("[bridge] old server after the move: " + ("deleted" if delete_old else "kept (delete it by hand)"))
+    if dry_run:
+        typer.echo("[bridge] dry-run: nothing ordered")
+        return 0
+    if not yes and not typer.confirm(f"Order VDSina servers at {price} each?", default=False):
+        return fail("aborted")
+    try:
+        key_id = vdsina.ensure_ssh_key(request, pub.read_text())
+        user = manual["ssh_user"]
+        cand = bridge_rotate.find_good_server(
+            request, spec, key_id,
+            check=lambda ip: bridge_rotate.check_candidate(
+                ip, user, key, exit_ip=exit_ip, chain_port=chain_port, cert=cert, privkey=privkey, host=domain),
+            ready=lambda ip: bridge_rotate.wait_ssh(ip, user, key),
+            attempts=attempts, echo=typer.echo, name=f"pp-bridge-{datetime.now(timezone.utc):%m%d%H%M}",
+        )
+    except (OSError, vdsina.ApiError) as e:
+        return fail(str(e))
+    if cand is None:
+        return fail(f"no server passed the checks in {attempts} attempt(s); the bridge was not touched")
+    typer.echo(f"[bridge] {cand.ip} passed every check — moving the bridge")
+    rc = subprocess.call(["bash", str(script), "bridge", "--bridge-ip", cand.ip], cwd=str(paths.repo_root()))
+    if rc != 0:
+        typer.secho(f"[bridge] the move failed; new server {cand.server_id} ({cand.ip}) is kept for inspection",
+                    fg=typer.colors.RED)
+        return rc
+    if old and delete_old:
+        vdsina.delete_server(request, int(old["id"]))
+        typer.echo(f"[bridge] old server {old['id']} ({manual['ip']}) deleted")
+    elif old:
+        typer.echo(f"[bridge] old server {old['id']} ({manual['ip']}) still runs and is billed: delete it in the"
+                   " VDSina panel once clients work")
+    return 0
 
 
 def main() -> None:

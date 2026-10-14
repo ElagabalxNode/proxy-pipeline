@@ -80,3 +80,8 @@ def test_stale_state_is_synced_before_dns_is_touched():
     assert fixes["Bridge (RU)"] == ["pipelinectl configure --bridge-only", "pipelinectl status"]
     assert "pipelinectl dns ensure" not in " ".join(fixes["DNS name"])
     assert diagnose(ALL_GOOD, declared_bridge="203.0.113.2", recorded_bridge="203.0.113.2")[1].ok
+
+
+def test_a_bridge_with_an_api_is_replaced_by_one_command():
+    parts = diagnose(ALL_GOOD, outside=(5, 20), bridge_automatic=True)
+    assert _broken(parts) == {"Bridge (RU)": ["pipelinectl rotate bridge   (orders, checks and moves to a new server)"]}

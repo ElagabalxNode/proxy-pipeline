@@ -51,12 +51,14 @@ def diagnose(
     providers: dict[str, str] | None = None,
     declared_bridge: str = "",
     recorded_bridge: str = "",
+    bridge_automatic: bool = False,
 ) -> list[Part]:
     """Parts of the chain with their problems and fix commands, worst evidence first.
 
     `outside` is (networks that reached the bridge, networks asked) from Russian vantage points.
     `declared_bridge` is bridge_manual.ip from config, `recorded_bridge` the address in state:
     when they differ the checks ran against a stale address and state must be synced first.
+    `bridge_automatic`: `rotate bridge` can order a new server itself (VDSina API, Terraform).
     """
     p = {"exit": "Cherry Servers", "bridge": "manual RU server", "dns": "Timeweb DNS", **(providers or {})}
     r = {c.name: c for c in checks}
@@ -122,7 +124,9 @@ def diagnose(
         exit_.fix = ["pipelinectl rotate exit --yes",
                      "(out of stock: pipelinectl stock, then add --region SLUG)"]
     dead = _failed(r, "bridge_ssh") or (chain and direct) or filtered
-    if dead:
+    if dead and bridge_automatic:
+        bridge.fix = ["pipelinectl rotate bridge   (orders, checks and moves to a new server)"]
+    elif dead:
         bridge.fix = ["create a new RU server with the controller's SSH key (provider panel)",
                       "pipelinectl rotate bridge --bridge-ip NEW_IP"]
     elif software:

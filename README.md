@@ -45,7 +45,8 @@ ssh-copy-id -i ~/.ssh/proxy_pipeline.pub root@<IP_МОСТА>     # на RU VPS
 **3. Секреты** (в git не попадают):
 
 ```bash
-cp .env.example .env        # CHERRY_API_TOKEN, PROXY_PIPELINE_PANEL_PASS, TIMEWEBCLOUD_AUTH_TOKEN
+cp .env.example .env        # CHERRY_API_TOKEN, PROXY_PIPELINE_PANEL_PASS, TIMEWEBCLOUD_AUTH_TOKEN,
+                            # VDSINA_API_TOKEN (для автоматической замены моста)
 set -a; . ./.env; set +a    # перед каждой сессией
 ```
 
@@ -64,7 +65,7 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 | `terraform.tfvars` | `xui_version`, `xui_archive_sha256` | закреплённый релиз 3X-UI для Exit |
 | `pipeline.yaml` | `xray.world_release` | та же версия 3X-UI, версия и SHA256 Xray внутри архива (`pipelinectl world-release --archive <tar.gz>`) |
 | `pipeline.yaml` | `xray.bridge_release` | версия и SHA256 архива Xray для моста |
-| `pipeline.yaml` | `bridge_manual.ip` | адрес RU VPS |
+| `pipeline.yaml` | `bridge_manual.ip`, `provider` | адрес RU VPS; `provider: VDSina` включает замену моста через API |
 | `pipeline.yaml` | `bridge_entry.domain`, `zone` | имя входа, например `lk.example.ru` |
 | `pipeline.yaml` | `acme.lego_release` | версия и SHA256 lego для выпуска сертификата |
 | `pipeline.yaml` | `firewall.direct_policy` | кто может ходить на Exit напрямую: `public`, `allowlist` или `closed` |
@@ -87,6 +88,15 @@ pipelinectl links --qr                    # ссылки в .client-links, QR в
 `configure` ставит на контроллер таймеры: каждые 5 минут журнал проверок забирается с моста, а
 `pipelinectl watchdog` при сбое шлёт оповещение (Telegram, e-mail, SMS — секция `alerts`).
 
+## Меню
+
+```bash
+pipelinectl menu
+```
+
+Всё то же, что ниже, но по номерам: статус, схема цепочки (узлы, адреса, домен, срок
+сертификата), проверки, ссылки, замена Exit или моста с подтверждением, основные настройки.
+
 ## Если что-то отвалилось
 
 **Шаг 1 — понять, что сломано:**
@@ -101,8 +111,7 @@ pipelinectl status
 [OK  ] Exit (WORLD)   Cherry Servers
 [DOWN] Bridge (RU)    VDSina
          - only 6 of 20 Russian networks reach the bridge address (address filtered)
-         fix 1: create a new RU server with the controller's SSH key (provider panel)
-         fix 2: pipelinectl rotate bridge --bridge-ip NEW_IP
+         fix 1: pipelinectl rotate bridge   (orders, checks and moves to a new server)
 [OK  ] DNS name       Timeweb DNS
 [OK  ] Certificate    Let's Encrypt via DNS-01
 ```
@@ -116,26 +125,39 @@ pipelinectl status
 | Сломано | Команда | Что произойдёт |
 |---|---|---|
 | Exit | `pipelinectl rotate exit --yes` | Новый Exit в Cherry, проверки достижимости с моста и репутации IP, настройка, перенастройка моста. Если нет в наличии: `pipelinectl stock`, затем `--region <SLUG>` |
-| Мост: сервер умер или адрес фильтруется | создать новый RU VPS с ключом контроллера, затем `pipelinectl rotate bridge --bridge-ip <НОВЫЙ_IP>` | Мост ставится на новый сервер с прежней identity и сертификатом, DNS переводится на него, `bridge_manual.ip` обновляется |
+| Мост: сервер умер или адрес фильтруется | `pipelinectl rotate bridge` | См. ниже: новый сервер, проверки, перенос |
 | Мост: сервер жив, но вход не отвечает | `pipelinectl configure --bridge-only` | Переустановка конфигурации Xray/nginx на мосту |
 | DNS | `pipelinectl dns ensure --replace` | A-записи домена снова указывают на мост |
 | Сертификат | `pipelinectl cert renew --deploy` | Продление и доставка на мост |
+
+**Как заменяется мост.** `rotate bridge` сам определяет, чем мост управляется:
+
+- **Yandex в Terraform** — сервер пересоздаётся Terraform за тем же адресом.
+- **VDSina** (`bridge_manual.provider: VDSina`) — через API заказывается сервер с теми же
+  дата-центром, тарифом и ОС, что у текущего. До переключения кандидат проходит три проверки:
+  репутация адреса, TLS с него к зарубежным сайтам и связь с Exit, доступность HTTPS на нём из
+  ~20 российских сетей. Не прошедший сразу удаляется, заказывается следующий (`--attempts`, по
+  умолчанию 3). Прошедший получает мост с прежней identity и сертификатом, на него переводится
+  DNS. Старый сервер остаётся, пока не передан `--delete-old`. Перед заказом печатается цена и
+  спрашивается подтверждение; `--dry-run` только показывает план.
+- **Другой провайдер без API** — создайте сервер с ключом контроллера и выполните
+  `pipelinectl rotate bridge --bridge-ip <НОВЫЙ_IP>`.
 
 После любой починки — снова `pipelinectl status`. Ссылки у клиентов не меняются; DNS-кеш на
 устройствах обновляется в течение ~10 минут (до этого можно временно указать IP в поле «Адрес»
 профиля, оставив SNI и Host с доменом).
 
-Новый адрес моста до переноса можно проверить из российских сетей: на нём должен отвечать HTTPS.
-Для VDSina есть помощник `.venv/bin/python scripts/vdsina_ip.py overview | check <IP>`.
 
 ## Команды
 
 | Команда | Назначение |
 |---|---|
+| `pipelinectl menu` | интерактивное меню |
 | `pipelinectl status` | какой узел сломан и чем чинить |
 | `pipelinectl validate [--deep]` | все проверки подробно |
 | `pipelinectl chainlog [--since 7d]` | история проверок с моста: когда и что падало |
-| `pipelinectl rotate exit\|bridge` | заменить узел |
+| `pipelinectl rotate exit [--region R]` | заменить Exit |
+| `pipelinectl rotate bridge [--dry-run\|--delete-old\|--bridge-ip IP]` | заменить мост |
 | `pipelinectl configure [--bridge-only]` | применить конфигурацию к узлам |
 | `pipelinectl links [--qr]` | клиентские ссылки и QR |
 | `pipelinectl dns show\|ensure` | DNS-записи домена моста |
