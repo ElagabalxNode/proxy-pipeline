@@ -1085,24 +1085,36 @@ def notify_cmd(
 @app.command("links")
 def links_cmd(
     export: bool = typer.Option(True, "--export/--no-export", help="Write repo .client-links"),
-    qr: bool = typer.Option(False, "--qr/--no-qr", help="Write PNG QR codes to .client-links-qr"),
+    qr: bool = typer.Option(
+        True, "--qr/--no-qr", help="Write PNG QR codes to .client-links-qr (with every export)"
+    ),
     fmt: str = typer.Option("text", "--format", help="text or json"),
 ) -> None:
-    """Print (and optionally write) client links from state/*.json."""
+    """Print (and optionally write) client links from state/*.json.
+
+    The text file and the QR codes are written together, so the QRs never lag behind the links
+    (on 2026-10-19 QRs from 13.10 still pointed to the old bridge address).
+    """
     cfg = _cfg()
     root = paths.repo_root()
     st = paths.state_dir(cfg)
-    text = links.export_client_links(
-        root,
-        st,
-        fmt=("json" if fmt == "json" else "text"),
-        write_file=export and fmt != "json",
-        write_qr=qr and fmt != "json",
-    )
+    entry = cfg.get("bridge_entry") if isinstance(cfg.get("bridge_entry"), dict) else {}
+    try:
+        text = links.export_client_links(
+            root,
+            st,
+            fmt=("json" if fmt == "json" else "text"),
+            write_file=export and fmt != "json",
+            write_qr=export and qr and fmt != "json",
+            xhttp_client_mode=str(entry.get("client_mode") or "") or None,
+        )
+    except ValueError as e:
+        typer.secho(f"[links] {e}", fg=typer.colors.RED)
+        raise typer.Exit(1) from e
     typer.echo(text)
     if export and fmt != "json":
         typer.echo(f"[links] wrote {root / '.client-links'}")
-    if qr and fmt != "json":
+    if export and qr and fmt != "json":
         typer.echo(f"[links] wrote {root / '.client-links-qr'}")
 
 

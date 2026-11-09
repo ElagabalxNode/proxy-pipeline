@@ -4,6 +4,8 @@ import base64
 import json
 from pathlib import Path
 
+import pytest
+
 from pipelinectl import links
 
 EXIT = {
@@ -42,7 +44,7 @@ def _links(st: Path, exit_d: dict, bridge_d: dict) -> dict[str, str]:
 
 
 def _ss_userinfo(method: str, password: str) -> str:
-    return base64.b64encode(f"{method}:{password}".encode()).decode().rstrip("=")
+    return base64.urlsafe_b64encode(f"{method}:{password}".encode()).decode().rstrip("=")
 
 
 def test_bridge_links_use_bridge_identity_not_exit(tmp_path: Path) -> None:
@@ -53,7 +55,7 @@ def test_bridge_links_use_bridge_identity_not_exit(tmp_path: Path) -> None:
     assert "exit.example.com" not in bv
     assert (
         bs
-        == f"ss://{_ss_userinfo(BRIDGE['bridge_ss_method'], 'bridge-ss-pass')}@198.51.100.5:8388#Bridge-SS2022-198.51.100.5"
+        == f"ss://{_ss_userinfo(BRIDGE['bridge_ss_method'], 'bridge-ss-pass')}@198.51.100.5:8388#Bridge-SS2022"
     )
 
 
@@ -88,7 +90,7 @@ def test_bridge_links_fall_back_to_exit_fields_for_old_state(tmp_path: Path) -> 
     assert "sni=exit.example.com" in m["bridge_vless"]
     assert (
         m["bridge_shadowsocks"]
-        == f"ss://{_ss_userinfo(EXIT['ss_method'], 'exit-ss-pass')}@198.51.100.5:8388#Bridge-SS2022-198.51.100.5"
+        == f"ss://{_ss_userinfo(EXIT['ss_method'], 'exit-ss-pass')}@198.51.100.5:8388#Bridge-SS2022"
     )
 
 
@@ -119,7 +121,7 @@ def test_xhttp_link_addresses_the_domain_and_carries_no_flow_or_chain_secrets(tm
     assert link == (
         "vless://xhttp-uuid@lk.example.ru:443?encryption=none&security=tls&sni=lk.example.ru&alpn=h2"
         "&fp=firefox&type=xhttp&host=lk.example.ru&path=%2Fa1b2c3d4e5f6&mode=stream-up"
-        "#Bridge-XHTTP-lk.example.ru"
+        "#Bridge-XHTTP"
     )
     assert "flow" not in link and "198.51.100.5" not in link and "reality" not in link
     everything = json.dumps(m)
@@ -154,3 +156,65 @@ def test_export_lists_the_https_profile_first_and_marks_the_reserve(tmp_path: Pa
     (tmp_path / "bridge_runtime.json").write_text(json.dumps(BRIDGE), encoding="utf-8")
     plain = links.export_client_links(tmp_path, tmp_path, write_file=False)
     assert "# THROUGH BRIDGE\n" in plain and "reserve" not in plain
+
+
+# ── link options that clients depend on (2026-10-20) ─────────────────────────────────
+
+def test_an_auto_server_still_tells_the_client_one_mode(tmp_path: Path) -> None:
+    auto = {**HTTPS_BRIDGE, "bridge_xhttp_mode": "auto"}
+    (tmp_path / "runtime.json").write_text(json.dumps(EXIT), encoding="utf-8")
+    (tmp_path / "bridge_runtime.json").write_text(json.dumps(auto), encoding="utf-8")
+    d = links.load_merged_runtime(tmp_path)
+    assert links.build_bridge_xhttp(d).endswith("&mode=stream-up#Bridge-XHTTP")
+    assert "&mode=stream-one#" in links.build_bridge_xhttp(d, "stream-one")
+    assert "mode=auto" not in json.dumps(links.build_client_links_map(d))
+    # a server restricted to one mode wins over the client option
+    assert "&mode=packet-up#" in links.build_bridge_xhttp({**d, "bridge_xhttp_mode": "packet-up"}, "stream-up")
+    with pytest.raises(ValueError, match="client_mode"):
+        links.build_bridge_xhttp(d, "auto")
+
+
+def test_bridge_profiles_use_the_bridge_fingerprint_and_direct_keeps_chrome(tmp_path: Path) -> None:
+    m = _links(tmp_path, EXIT, HTTPS_BRIDGE)
+    assert "&fp=firefox&" in m["bridge_xhttp"] and "&fp=firefox&" in m["bridge_vless"]
+    assert "&fp=chrome&" in m["direct_vless"]
+
+
+def test_ss_links_use_url_safe_base64(tmp_path: Path) -> None:
+    # this password's standard base64 contains '+' and '/', which clients may read as URL syntax
+    exit_d = {**EXIT, "ss_password": "\xfb\xff?>"}
+    link = _links(tmp_path, exit_d, BRIDGE)["direct_shadowsocks"]
+    userinfo = link[len("ss://"):link.index("@")]
+    assert "+" not in userinfo and "/" not in userinfo
+    assert base64.urlsafe_b64decode(userinfo + "==").decode() == "2022-blake3-aes-128-gcm:\xfb\xff?>"
+
+
+def test_export_writes_private_files_and_never_leaves_a_stale_qr(tmp_path: Path) -> None:
+    (tmp_path / "runtime.json").write_text(json.dumps(EXIT), encoding="utf-8")
+    (tmp_path / "bridge_runtime.json").write_text(json.dumps(HTTPS_BRIDGE), encoding="utf-8")
+    qr = tmp_path / ".client-links-qr"
+    qr.mkdir()
+    (qr / "bridge_old_profile.png").write_bytes(b"stale")
+    links.export_client_links(tmp_path, tmp_path, write_qr=True)
+    pngs = sorted(p.name for p in qr.glob("*.png"))
+    assert pngs == ["bridge_shadowsocks.png", "bridge_vless.png", "bridge_xhttp.png",
+                    "direct_shadowsocks.png", "direct_vless.png"]
+    assert not list(qr.glob(".*.tmp"))
+    assert (qr.stat().st_mode & 0o777) == 0o700
+    assert all((p.stat().st_mode & 0o777) == 0o600 for p in qr.glob("*.png"))
+    assert ((tmp_path / ".client-links").stat().st_mode & 0o777) == 0o600
+    # a QR is the current link, not an older one: regenerate and compare
+    before = (qr / "bridge_vless.png").read_bytes()
+    moved = {**HTTPS_BRIDGE, "bridge_ip": "198.51.100.77"}
+    (tmp_path / "bridge_runtime.json").write_text(json.dumps(moved), encoding="utf-8")
+    links.export_client_links(tmp_path, tmp_path, write_qr=True)
+    assert (qr / "bridge_vless.png").read_bytes() != before
+
+
+def test_profile_names_do_not_change_when_servers_do(tmp_path: Path) -> None:
+    before = _links(tmp_path, EXIT, HTTPS_BRIDGE)
+    rotated = {**EXIT, "exit_ip": "203.0.113.99"}
+    moved = {**HTTPS_BRIDGE, "bridge_ip": "198.51.100.77"}
+    after = _links(tmp_path, rotated, moved)
+    names = {k: v.rsplit("#", 1)[1] for k, v in after.items()}
+    assert names == {k: v.rsplit("#", 1)[1] for k, v in before.items()} == links.NAMES
