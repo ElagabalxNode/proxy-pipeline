@@ -102,6 +102,10 @@ bridge_entry:
   # What the server accepts: auto (default, every XHTTP mode: client apps choose their own and
   # may ignore the link), stream-up, or packet-up (only for a path through a buffering CDN).
   xhttp_mode: auto
+  # Mode written into the client link when xhttp_mode is auto (a link never says "auto": apps
+  # then pick their own, Shadowrocket picked packet-up — a burst of tiny requests). stream-up,
+  # stream-one or packet-up; with a fixed xhttp_mode the link uses that mode instead.
+  client_mode: stream-up
   site_dir: ""               # optional directory with a static site; empty = built-in page
   # Other names of the zone that show only that page, e.g. [example.ru, www.example.ru]: the
   # bare domain then is an ordinary site instead of a name that does not resolve.
