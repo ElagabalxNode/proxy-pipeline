@@ -94,7 +94,10 @@ def reputation_gate(ip: str, fetch: Callable[[str], tuple[Any, str]] = iprep.fet
     data, err = fetch(ip)
     if err:
         return True, f"reputation not checked ({err})"
-    clean, reason = iprep.assess(data, allowed_ports=frozenset({22, 80, 443}))
+    # Every VDSina address is recycled and keeps the provider's own reverse name of an earlier
+    # server (v<id>.hosted-by-vdsina.ru): that is not a foreign tenant's hostname.
+    clean, reason = iprep.assess(data, allowed_ports=frozenset({22, 80, 443}),
+                                 own_ptr_suffix=".hosted-by-vdsina.ru")
     return clean, f"reputation: {reason}"
 
 

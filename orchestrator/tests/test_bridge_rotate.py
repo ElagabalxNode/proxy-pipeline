@@ -145,3 +145,12 @@ def test_rotate_bridge_picks_the_tool_by_how_the_bridge_is_run(monkeypatch):
     assert cli._bridge_kind({}) == "none"
     listed["out"] = "module.bridge[0].yandex_compute_instance.bridge\n"
     assert cli._bridge_kind(manual) == "yandex"
+
+
+def test_a_recycled_vdsina_name_is_not_a_foreign_tenant():
+    # 2026-10-28: a clean new server was rejected for its earlier VDSina reverse name
+    record = {"hostnames": ["v3258314.hosted-by-vdsina.ru"], "ports": [3389], "tags": ["self-signed"]}
+    ok, note = bridge_rotate.reputation_gate("203.0.113.1", fetch=lambda ip: (record, ""))
+    assert ok, note
+    foreign = {"hostnames": ["mail.some-shop.example"], "ports": [], "tags": []}
+    assert not bridge_rotate.reputation_gate("203.0.113.1", fetch=lambda ip: (foreign, ""))[0]
